@@ -65,18 +65,43 @@ jobs:
           scm-do-build-during-deployment: false
           enable-oryx-build: false
 
+      - name: Diagnose Function App (settings + restart + discovered functions)
+        run: |
+          APP="${{ vars.FUNCTION_APP_NAME }}"
+          RG="$(az functionapp list --query "[?name=='$APP'].resourceGroup | [0]" -o tsv)"
+          if [ -z "$RG" ]; then
+            echo "::error::Could not locate resource group for $APP"
+            exit 1
+          fi
+          echo "RG=$RG"
+
+          echo "----- relevant app settings -----"
+          az functionapp config appsettings list -g "$RG" -n "$APP" \
+            --query "[?name=='AzureWebJobsFeatureFlags' || name=='FUNCTIONS_WORKER_RUNTIME' || name=='FUNCTIONS_EXTENSION_VERSION' || name=='WEBSITE_RUN_FROM_PACKAGE']" \
+            -o table
+
+          echo "----- linux fx version -----"
+          az functionapp config show -g "$RG" -n "$APP" --query "linuxFxVersion" -o tsv
+
+          echo "----- restarting to force function re-index -----"
+          az functionapp restart -g "$RG" -n "$APP"
+          sleep 45
+
+          echo "----- discovered functions (after restart) -----"
+          az functionapp function list -g "$RG" -n "$APP" -o table || echo "(none discovered)"
+
       - name: Smoke test /api/health
         run: |
           url="https://${{ vars.FUNCTION_APP_NAME }}.azurewebsites.net/api/health"
           echo "GET $url"
-          for i in $(seq 1 20); do
+          for i in $(seq 1 30); do
             code=$(curl -s -o /tmp/body -w "%{http_code}" "$url" || echo 000)
             if [ "$code" = "200" ]; then
               echo "Healthy. Body:"
               cat /tmp/body
               exit 0
             fi
-            echo "($i/20) HTTP $code — waiting for cold start..."
+            echo "($i/30) HTTP $code — waiting for cold start..."
             sleep 6
           done
           echo "::error::Health check never returned 200"
