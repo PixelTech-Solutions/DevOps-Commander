@@ -1,0 +1,80 @@
+name: "Deploy Function (Alert Receiver)"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate FUNCTION_APP_NAME is set
+        env:
+          FUNCTION_APP_NAME: ${{ vars.FUNCTION_APP_NAME }}
+        run: |
+          if [ -z "$FUNCTION_APP_NAME" ]; then
+            echo "::error::Repo variable FUNCTION_APP_NAME is missing." \
+                 "Run the Provision workflow in DevOps-Commander-Infra first," \
+                 "then copy the 'function_app_name' Terraform output into" \
+                 "Settings > Variables > New repository variable."
+            exit 1
+          fi
+          echo "Deploying to $FUNCTION_APP_NAME"
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies (local validation only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Quick syntax check
+          python -m py_compile function_app.py
+
+      - name: Azure login (service principal)
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId":       "${{ secrets.ARM_CLIENT_ID }}",
+              "clientSecret":   "${{ secrets.ARM_CLIENT_SECRET }}",
+              "tenantId":       "${{ secrets.ARM_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ vars.FUNCTION_APP_NAME }}
+          package: .
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+
+      - name: Smoke test /api/health
+        run: |
+          url="https://${{ vars.FUNCTION_APP_NAME }}.azurewebsites.net/api/health"
+          echo "GET $url"
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /tmp/body -w "%{http_code}" "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Healthy. Body:"
+              cat /tmp/body
+              exit 0
+            fi
+            echo "($i/20) HTTP $code — waiting for cold start..."
+            sleep 6
+          done
+          echo "::error::Health check never returned 200"
+          cat /tmp/body || true
+          exit 1

@@ -1,0 +1,27 @@
+# Azure Functions
+local.settings.json
+__azurite_db_*__.json
+__blobstorage__/
+__queuestorage__/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts
+.python_packages/
+bin/
+obj/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
