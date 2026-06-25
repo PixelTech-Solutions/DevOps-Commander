@@ -35,11 +35,14 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies (local validation only)
+      - name: Install dependencies into deployment package
+        # Linux Consumption + RBAC deploys bypass Kudu/Oryx, so requirements.txt
+        # is NOT auto-installed on the Function App. We must bundle the deps
+        # into .python_packages/lib/site-packages/ — that's the path the
+        # Python worker prepends to sys.path at startup.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # Quick syntax check
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
           python -m py_compile function_app.py
 
       - name: Azure login (service principal)
@@ -58,8 +61,9 @@ jobs:
         with:
           app-name: ${{ vars.FUNCTION_APP_NAME }}
           package: .
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+          # Remote build is skipped anyway on Y1 Linux + RBAC, so leave these off.
+          scm-do-build-during-deployment: false
+          enable-oryx-build: false
 
       - name: Smoke test /api/health
         run: |
