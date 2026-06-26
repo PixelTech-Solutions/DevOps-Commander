@@ -111,6 +111,26 @@ def _disk_usage(_params: dict) -> str:
     return "df -h / 2>&1"
 
 
+# --- Destructive builders. Still parameterized with validated integers only;
+#     these only run after a signed, single-use approval token is presented. ---
+def _delete_customer(params: dict) -> str:
+    cid = _q_int(params, "id", minimum=1)
+    # SELECT ROW_COUNT() reports how many rows were removed (0 if no such id).
+    # The orders.customer_id foreign key blocks deleting a customer who still
+    # has orders; that error is captured via 2>&1 and surfaced to the caller.
+    return (
+        f'{_MYSQL} -e "DELETE FROM customers WHERE id = {cid}; '
+        f'SELECT ROW_COUNT() AS deleted;" 2>&1'
+    )
+
+
+def _restart_service(_params: dict) -> str:
+    return (
+        "systemctl restart erp-backend; sleep 2; echo '== erp-backend =='; "
+        "systemctl is-active erp-backend 2>&1"
+    )
+
+
 ACTIONS: dict[str, dict] = {
     "count_customers": {
         "target": "db",
@@ -147,6 +167,18 @@ ACTIONS: dict[str, dict] = {
         "destructive": False,
         "description": "Show root filesystem disk usage on the app server.",
         "build": _disk_usage,
+    },
+    "delete_customer": {
+        "target": "db",
+        "destructive": True,
+        "description": "Delete one customer by id (blocked by FK if they have orders). Param: id (>=1).",
+        "build": _delete_customer,
+    },
+    "restart_service": {
+        "target": "app",
+        "destructive": True,
+        "description": "Restart the erp-backend service on the app server.",
+        "build": _restart_service,
     },
 }
 
@@ -202,39 +234,34 @@ def _run_on_vm(resource_group: str, vm_name: str, script: str) -> str:
     return "\n".join(messages).strip() or "(no output)"
 
 
-def run_action(action: str, env: str, params: dict | None = None) -> dict:
-    """Validate and run an allow-listed action against a development VM.
+def _validate(action: str, env: str, params: dict) -> tuple[dict, str]:
+    """Run every safety gate without touching Azure. Returns (spec, command).
 
-    Returns a structured result dict. Raises ActionError for anything refused
-    (unknown env/action, production, bad parameters). Read-only actions run
-    immediately; destructive ones are rejected here until the approval path
-    (token + gate) is wired in.
+    Raises ActionError for a blocked environment, unknown action, or bad
+    parameters. Building the command here also validates the parameters (the
+    builders coerce them to bounded ints), so an invalid request is rejected
+    before any token is issued or any VM is contacted.
     """
-    params = params or {}
-
     # 1. Environment gate — production and anything unknown stop here, in code.
     if env not in ENV_TARGETS:
         raise ActionError(
             f"environment '{env}' is not allowed; the executor only operates on "
             f"{', '.join(ALLOWED_ENVS)} (production is blocked)"
         )
-
     # 2. Allow-list gate.
     spec = ACTIONS.get(action)
     if spec is None:
         raise ActionError(f"unknown action '{action}'")
+    # 3. Parameter validation happens inside the builder.
+    command = spec["build"](params)
+    return spec, command
 
-    # 3. Destructive actions are not runnable yet (approval path comes later).
-    if spec["destructive"]:
-        raise ActionError(
-            f"action '{action}' is destructive and requires the approval flow "
-            "(not yet enabled)"
-        )
 
+def _execute(action: str, env: str, params: dict, spec: dict, command: str) -> dict:
+    """Run an already-validated action on its development VM and audit it."""
     target = ENV_TARGETS[env]
     vm_name = target[spec["target"]]
     resource_group = target["resource_group"]
-    command = spec["build"](params)  # may raise ActionError on bad params
 
     audit = {
         "action": action,
@@ -242,6 +269,7 @@ def run_action(action: str, env: str, params: dict | None = None) -> dict:
         "target": spec["target"],
         "vm": vm_name,
         "params": params,
+        "destructive": spec["destructive"],
     }
     logging.info("executor_attempt %s", json.dumps(audit, default=str))
 
@@ -262,3 +290,169 @@ def run_action(action: str, env: str, params: dict | None = None) -> dict:
         "vm": vm_name,
         "output": output,
     }
+
+
+def _summarize(action: str, env: str, params: dict) -> str:
+    """A plain-English description of what a destructive action will do."""
+    if action == "delete_customer":
+        return (
+            f"This will permanently DELETE customer id={params.get('id')} on the "
+            f"{env} database. This cannot be undone."
+        )
+    if action == "restart_service":
+        return f"This will RESTART the erp-backend service on the {env} app server."
+    return f"This will run '{action}' on {env}."
+
+
+def run_action(action: str, env: str, params: dict | None = None) -> dict:
+    """Run a read-only allow-listed action immediately.
+
+    Destructive actions are refused here — they must go through
+    ``request_action`` -> ``approve_and_run`` (the signed-token gate).
+    """
+    params = params or {}
+    spec, command = _validate(action, env, params)
+    if spec["destructive"]:
+        raise ActionError(
+            f"action '{action}' is destructive; request it to get an approval token"
+        )
+    return _execute(action, env, params, spec, command)
+
+
+# ===========================================================================
+# Two-step approval for destructive actions.
+#
+# A destructive request never executes. It returns a signed, single-use,
+# short-lived token that a human must present to ``approve_and_run``. The
+# signing key is derived from the shared secret (domain-separated, so it is not
+# the same value used for request authentication) and single use is enforced by
+# recording the token's nonce in Table Storage — a replay finds the row already
+# there and is rejected.
+# ===========================================================================
+_TOKEN_TTL_SECONDS = 600
+_NONCE_TABLE = "approvaltokens"
+
+
+def _signing_key() -> bytes:
+    import hashlib
+
+    secret = os.environ.get("CHAT_SHARED_SECRET") or os.environ.get("ALERT_SHARED_SECRET", "")
+    if not secret:
+        raise ActionError("approval signing secret is not configured")
+    return hashlib.sha256(f"approval-token-v1:{secret}".encode()).digest()
+
+
+def _make_token(action: str, env: str, params: dict) -> tuple[str, dict]:
+    import base64
+    import hashlib
+    import hmac
+    import time
+    import uuid
+
+    payload = {
+        "action": action,
+        "env": env,
+        "params": params,
+        "nonce": uuid.uuid4().hex,
+        "exp": int(time.time()) + _TOKEN_TTL_SECONDS,
+    }
+    raw = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode()
+    sig = hmac.new(_signing_key(), raw.encode(), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}", payload
+
+
+def _verify_token(token: str) -> dict:
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    raw, _, sig = (token or "").partition(".")
+    if not raw or not sig:
+        raise ActionError("malformed approval token")
+    expected = hmac.new(_signing_key(), raw.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise ActionError("invalid approval token signature")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(raw.encode()))
+    except Exception:
+        raise ActionError("corrupt approval token")
+    if int(payload.get("exp", 0)) < int(time.time()):
+        raise ActionError("approval token has expired; request the action again")
+    return payload
+
+
+def _consume_nonce(nonce: str) -> None:
+    """Record a token's nonce so it can never be approved twice."""
+    from datetime import datetime, timezone
+
+    from azure.core.exceptions import ResourceExistsError
+    from azure.data.tables import TableServiceClient
+
+    conn = os.environ.get("AzureWebJobsStorage")
+    if not conn:
+        raise ActionError("approval store is not configured")
+    service = TableServiceClient.from_connection_string(conn)
+    table = service.create_table_if_not_exists(_NONCE_TABLE)
+    try:
+        table.create_entity(
+            {
+                "PartitionKey": "approval",
+                "RowKey": nonce,
+                "usedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    except ResourceExistsError:
+        raise ActionError("this approval token has already been used")
+
+
+def request_action(action: str, env: str, params: dict | None = None) -> dict:
+    """Entry point for a caller. Read-only actions run now; destructive actions
+    are validated and return an approval token instead of executing."""
+    params = params or {}
+    spec, command = _validate(action, env, params)
+    if not spec["destructive"]:
+        result = _execute(action, env, params, spec, command)
+        result["requires_approval"] = False
+        return result
+
+    token, payload = _make_token(action, env, params)
+    logging.info(
+        "approval_requested %s",
+        json.dumps(
+            {"action": action, "env": env, "params": params, "nonce": payload["nonce"]},
+            default=str,
+        ),
+    )
+    return {
+        "requires_approval": True,
+        "action": action,
+        "env": env,
+        "params": params,
+        "summary": _summarize(action, env, params),
+        "token": token,
+        "expires_in_seconds": _TOKEN_TTL_SECONDS,
+    }
+
+
+def approve_and_run(token: str) -> dict:
+    """Verify a token, spend it (single use), and run the destructive action."""
+    payload = _verify_token(token)
+    action = payload["action"]
+    env = payload["env"]
+    params = payload.get("params", {})
+
+    # Re-validate from scratch (defense in depth) before spending the token.
+    spec, command = _validate(action, env, params)
+    if not spec["destructive"]:
+        raise ActionError("token is not for a destructive action")
+
+    # Spend the nonce first: if this fails (reuse), nothing runs.
+    _consume_nonce(payload["nonce"])
+    logging.info(
+        "approval_granted %s",
+        json.dumps({"action": action, "env": env, "nonce": payload["nonce"]}, default=str),
+    )
+    return _execute(action, env, params, spec, command)
