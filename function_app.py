@@ -15,8 +15,6 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 
-import rca
-
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
@@ -71,15 +69,22 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("alert_received %s", json.dumps(event, default=str))
 
     # Single-agent MVP: ask GPT-4o for a root-cause analysis (keyless).
-    # Best-effort — a model failure must not stop us acknowledging the webhook.
+    # rca pulls in the openai / azure-identity SDKs, so import it lazily and
+    # guard everything — a model or dependency failure must never stop us
+    # acknowledging the webhook or break function indexing.
     rca_text = None
-    if rca.is_enabled():
-        rca_text = rca.analyze_alert(event)
-        if rca_text:
-            logging.info(
-                "alert_rca %s",
-                json.dumps({"source": source, "analysis": rca_text}, default=str),
-            )
+    if os.environ.get("AZURE_OPENAI_ENDPOINT"):
+        try:
+            import rca
+
+            rca_text = rca.analyze_alert(event)
+            if rca_text:
+                logging.info(
+                    "alert_rca %s",
+                    json.dumps({"source": source, "analysis": rca_text}, default=str),
+                )
+        except Exception:
+            logging.exception("rca_unavailable")
 
     return func.HttpResponse(
         json.dumps({"status": "accepted", "source": source, "rca": rca_text}),
