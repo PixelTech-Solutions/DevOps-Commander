@@ -30,7 +30,13 @@ import logging
 import os
 from functools import lru_cache
 
-from azure.ai.agents.models import ConnectedAgentTool, ListSortOrder, MessageRole
+from azure.ai.agents.models import (
+    AzureAISearchQueryType,
+    AzureAISearchTool,
+    ConnectedAgentTool,
+    ListSortOrder,
+    MessageRole,
+)
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 
@@ -43,6 +49,18 @@ _DIAGNOSE_INSTRUCTIONS = (
     "its severity. Reply with exactly two short lines:\n"
     "Root cause: <one sentence>\n"
     "Severity: <low|medium|high|critical>"
+)
+
+# When the Azure AI Search knowledge base is configured, the diagnosis agent
+# grounds its answer in recorded knowledge and cites the closest match (RAG).
+_DIAGNOSE_RAG_SUFFIX = (
+    "\nYou also have a knowledge tool over recorded ERP knowledge: past "
+    "incidents, the infrastructure inventory (environments, services, and "
+    "server IPs), and implementation history. Before answering, search it for "
+    "records relevant to this alert (e.g. the affected service or host) and let "
+    "the closest matches inform your root cause. Add a third line citing your "
+    "evidence:\n"
+    "Evidence: <id or title of the most relevant knowledge record, or 'none found'>"
 )
 
 _REMEDIATION_NAME = "devops-commander-remediation"
@@ -82,6 +100,7 @@ _COORDINATOR_INSTRUCTIONS = (
     "fix. Then compile ONE final report with exactly these lines:\n"
     "Root cause: ...\n"
     "Severity: <low|medium|high|critical>\n"
+    "Evidence: <the knowledge record the diagnosis cited, or 'none'>\n"
     "Proposed fix: ...\n"
     "Command: ...\n"
     "Risk: <low|medium|high>\n"
@@ -109,23 +128,55 @@ def _model() -> str:
     return os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
 
-def _ensure_agent(name: str, instructions: str, tools=None) -> str:
+def _ensure_agent(name: str, instructions: str, tools=None, tool_resources=None) -> str:
     """Get-or-create an agent by name; return its id.
 
     Looking up by our well-known name keeps cold starts from piling up
-    duplicate agents in the project.
+    duplicate agents in the project. When the agent already exists it is
+    updated in place so changes (new instructions, an attached knowledge tool)
+    take effect without anyone deleting and recreating it by hand.
     """
     client = _client()
     for agent in client.agents.list_agents():
         if agent.name == name:
+            try:
+                client.agents.update_agent(
+                    agent.id,
+                    model=_model(),
+                    instructions=instructions,
+                    tools=tools or [],
+                    tool_resources=tool_resources,
+                )
+            except Exception:
+                logging.debug("agent_update_failed name=%s", name, exc_info=True)
             return agent.id
     created = client.agents.create_agent(
         model=_model(),
         name=name,
         instructions=instructions,
         tools=tools or [],
+        tool_resources=tool_resources,
     )
     return created.id
+
+
+def _search_tool():
+    """Build the Azure AI Search knowledge tool, or None when RAG isn't configured.
+
+    Requires a Foundry project connection (CONNECTION_ID) to the Search service
+    and the index name. SIMPLE = keyword search, so no embeddings are needed.
+    Absent these settings the diagnosis agent simply runs without grounding.
+    """
+    conn_id = os.environ.get("AZURE_AI_SEARCH_CONNECTION_ID")
+    index = os.environ.get("AZURE_AI_SEARCH_INDEX")
+    if not conn_id or not index:
+        return None
+    return AzureAISearchTool(
+        index_connection_id=conn_id,
+        index_name=index,
+        query_type=AzureAISearchQueryType.SIMPLE,
+        top_k=3,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -135,7 +186,16 @@ def _coordinator_id() -> str:
     The coordinator is created with the specialists wired in as Connected Agent
     tools, so it can delegate to them by name at runtime.
     """
-    diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
+    search = _search_tool()
+    if search is not None:
+        diagnose_id = _ensure_agent(
+            _DIAGNOSE_NAME,
+            _DIAGNOSE_INSTRUCTIONS + _DIAGNOSE_RAG_SUFFIX,
+            tools=search.definitions,
+            tool_resources=search.resources,
+        )
+    else:
+        diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
     remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
     risk_id = _ensure_agent(_RISK_NAME, _RISK_INSTRUCTIONS)
 
