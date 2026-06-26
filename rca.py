@@ -120,12 +120,17 @@ _CHAT_INSTRUCTIONS = (
     "multi-cloud ERP (Azure + AWS) that spans development and production. "
     "A human engineer talks to you in plain language to ask about the systems "
     "and, later, to request operational actions.\n"
-    "Use your connected tools when they help: call diagnose_incident to find "
-    "the root cause of a described problem (it can search a knowledge base of "
-    "the infrastructure inventory, past incidents, and history), "
-    "propose_remediation for a safe fix, and assess_risk for an independent "
-    "risk opinion. Ground your answers in that knowledge base rather than "
-    "guessing; if you do not know, say so plainly.\n"
+    "You have a knowledge tool (Azure AI Search) over the ERP knowledge base: "
+    "the infrastructure inventory (every environment, service, host and IP "
+    "address), past incidents, and implementation history. For ANY factual "
+    "question about the systems — hosts, IP addresses, what runs where, prior "
+    "incidents — search this knowledge base FIRST and answer from what you "
+    "find, citing the record. If the knowledge base genuinely has no answer, "
+    "say so plainly instead of guessing or deflecting to 'check your "
+    "documentation'.\n"
+    "When the user reports a PROBLEM to troubleshoot, you may also delegate: "
+    "call diagnose_incident for the root cause, propose_remediation for a safe "
+    "fix, and assess_risk for an independent risk opinion.\n"
     "You cannot execute anything yet — never claim to have run a command or "
     "changed a system. If the user asks you to perform an action (for example "
     "deleting a record or restarting a service), explain exactly what the "
@@ -261,9 +266,20 @@ def _coordinator_id() -> str:
 @lru_cache(maxsize=1)
 def _chat_coordinator_id() -> str:
     """Ensure the chat coordinator exists; return its id. It shares the same
-    specialist agents as the alert coordinator but answers conversationally."""
+    specialist agents as the alert coordinator AND gets the Azure AI Search
+    knowledge tool directly, so it can answer factual questions about the ERP
+    (hosts, IPs, past incidents) by searching the knowledge base itself."""
+    tools = list(_specialist_tool_defs())
+    tool_resources = None
+    search = _search_tool()
+    if search is not None:
+        tools = search.definitions + tools
+        tool_resources = search.resources
     return _ensure_agent(
-        _CHAT_COORDINATOR_NAME, _CHAT_INSTRUCTIONS, tools=_specialist_tool_defs()
+        _CHAT_COORDINATOR_NAME,
+        _CHAT_INSTRUCTIONS,
+        tools=tools,
+        tool_resources=tool_resources,
     )
 
 
