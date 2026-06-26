@@ -68,12 +68,12 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
     #   traces | where message startswith "alert_received "
     logging.info("alert_received %s", json.dumps(event, default=str))
 
-    # Single-agent MVP: ask GPT-4o for a root-cause analysis (keyless).
-    # rca pulls in the openai / azure-identity SDKs, so import it lazily and
-    # guard everything — a model or dependency failure must never stop us
-    # acknowledging the webhook or break function indexing.
+    # First agent: a Foundry Agent Service agent produces a root-cause analysis
+    # (keyless). rca pulls in the azure-ai-projects / azure-identity SDKs, so
+    # import it lazily and guard everything — an agent or dependency failure must
+    # never stop us acknowledging the webhook or break function indexing.
     rca_text = None
-    if os.environ.get("AZURE_OPENAI_ENDPOINT"):
+    if os.environ.get("AZURE_AI_PROJECT_ENDPOINT"):
         try:
             import rca
 
