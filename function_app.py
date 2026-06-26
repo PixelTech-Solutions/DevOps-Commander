@@ -167,3 +167,72 @@ def chat(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
         mimetype="application/json",
     )
+
+
+@app.route(route="action", methods=["GET", "POST"])
+def action(req: func.HttpRequest) -> func.HttpResponse:
+    """GET/POST /api/action — the hands of the system (development only).
+
+    GET returns the safe allow-list of what can be run (names only, no
+    commands). POST runs one allow-listed, read-only action against a *dev* VM
+    via Azure Run Command and returns its output. Every guard that matters lives
+    in ``executor`` (environment block, allow-list, typed params, RBAC scope);
+    this route is just the authenticated HTTP edge. Protected by the same shared
+    secret as chat (``X-Chat-Token``).
+    """
+
+    expected = os.environ.get("CHAT_SHARED_SECRET") or os.environ.get("ALERT_SHARED_SECRET", "")
+    presented = req.headers.get("X-Chat-Token", "")
+    if not expected:
+        logging.error("Neither CHAT_SHARED_SECRET nor ALERT_SHARED_SECRET is configured")
+        return func.HttpResponse("server misconfigured", status_code=500)
+    if presented != expected:
+        logging.warning("Rejected action: bad/missing X-Chat-Token")
+        return func.HttpResponse("unauthorized", status_code=401)
+
+    import executor
+
+    if req.method == "GET":
+        return func.HttpResponse(
+            json.dumps({"actions": executor.list_actions(), "environments": list(executor.ALLOWED_ENVS)}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    body = body or {}
+    action_name = (body.get("action") or "").strip()
+    env = (body.get("env") or "").strip()
+    params = body.get("params") or {}
+    if not action_name or not env:
+        return func.HttpResponse(
+            json.dumps({"error": "missing 'action' or 'env'"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        result = executor.run_action(action_name, env, params)
+    except executor.ActionError as exc:
+        logging.warning("action_refused %s", json.dumps({"action": action_name, "env": env, "reason": str(exc)}))
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    except Exception:
+        logging.exception("action_failed")
+        return func.HttpResponse(
+            json.dumps({"error": "action execution failed"}),
+            status_code=502,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result),
+        status_code=200,
+        mimetype="application/json",
+    )

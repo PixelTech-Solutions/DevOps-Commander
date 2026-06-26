@@ -2,6 +2,8 @@ azure-functions==1.21.3
 azure-identity==1.19.0
 azure-ai-projects==1.0.0
 azure-ai-agents>=1.0.0,<2.0.0
+# Action executor: run allow-listed commands on dev VMs via Azure Run Command.
+azure-mgmt-compute==33.0.0
 # Pin cryptography to the last release that ships manylinux2014 (glibc 2.17)
 # wheels. azure-ai-projects pulls in azure-storage-blob -> cryptography, and a
 # newer wheel's Rust binding requires GLIBC_2.33, which the Functions Linux
