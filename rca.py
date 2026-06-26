@@ -110,6 +110,30 @@ _COORDINATOR_INSTRUCTIONS = (
     "(needs-human). Do not execute anything yourself. Be concise and concrete."
 )
 
+# --- Chat coordinator (ChatOps: a human talks to the fleet in plain language) -
+# Same specialist agents as the alert coordinator, but a conversational persona.
+# Advisory only: it can diagnose and explain, but it cannot execute anything yet
+# (execution arrives in a later step, behind the approval gate).
+_CHAT_COORDINATOR_NAME = "devops-commander-chat"
+_CHAT_INSTRUCTIONS = (
+    "You are DevOps Commander, a conversational ChatOps assistant for a "
+    "multi-cloud ERP (Azure + AWS) that spans development and production. "
+    "A human engineer talks to you in plain language to ask about the systems "
+    "and, later, to request operational actions.\n"
+    "Use your connected tools when they help: call diagnose_incident to find "
+    "the root cause of a described problem (it can search a knowledge base of "
+    "the infrastructure inventory, past incidents, and history), "
+    "propose_remediation for a safe fix, and assess_risk for an independent "
+    "risk opinion. Ground your answers in that knowledge base rather than "
+    "guessing; if you do not know, say so plainly.\n"
+    "You cannot execute anything yet — never claim to have run a command or "
+    "changed a system. If the user asks you to perform an action (for example "
+    "deleting a record or restarting a service), explain exactly what the "
+    "action would be, which environment and host it targets, and that it must "
+    "go through the approval gate before anything runs. Be concise, friendly, "
+    "and concrete."
+)
+
 
 def is_enabled() -> bool:
     """True when the Foundry project endpoint is configured."""
@@ -180,11 +204,12 @@ def _search_tool():
 
 
 @lru_cache(maxsize=1)
-def _coordinator_id() -> str:
-    """Ensure the three specialists + the coordinator exist; return coordinator id.
+def _specialist_tool_defs():
+    """Ensure the three specialist agents exist; return their Connected Agent tool
+    definitions so any coordinator can delegate to them by name.
 
-    The coordinator is created with the specialists wired in as Connected Agent
-    tools, so it can delegate to them by name at runtime.
+    Shared by both the alert coordinator and the chat coordinator, so the
+    specialists are created once and reused across the whole fleet.
     """
     search = _search_tool()
     if search is not None:
@@ -214,12 +239,32 @@ def _coordinator_id() -> str:
         name=_RISK_TOOL,
         description="Independently review a proposed fix and command, rate its risk, and decide whether human approval is required before it may run.",
     )
-    tools = (
+    return (
         diagnose_tool.definitions
         + remediation_tool.definitions
         + risk_tool.definitions
     )
-    return _ensure_agent(_COORDINATOR_NAME, _COORDINATOR_INSTRUCTIONS, tools=tools)
+
+
+@lru_cache(maxsize=1)
+def _coordinator_id() -> str:
+    """Ensure the specialists + the alert coordinator exist; return coordinator id.
+
+    The coordinator is created with the specialists wired in as Connected Agent
+    tools, so it can delegate to them by name at runtime.
+    """
+    return _ensure_agent(
+        _COORDINATOR_NAME, _COORDINATOR_INSTRUCTIONS, tools=_specialist_tool_defs()
+    )
+
+
+@lru_cache(maxsize=1)
+def _chat_coordinator_id() -> str:
+    """Ensure the chat coordinator exists; return its id. It shares the same
+    specialist agents as the alert coordinator but answers conversationally."""
+    return _ensure_agent(
+        _CHAT_COORDINATOR_NAME, _CHAT_INSTRUCTIONS, tools=_specialist_tool_defs()
+    )
 
 
 # A deterministic, code-side human-in-the-loop gate. The agents only advise;
@@ -318,4 +363,48 @@ def analyze_alert(event: dict) -> str | None:
                 logging.debug("thread_cleanup_failed", exc_info=True)
     except Exception:
         logging.exception("agent_rca_failed")
+        return None
+
+
+def analyze_chat(message: str, conversation_id: str | None = None) -> dict | None:
+    """Run the conversational chat coordinator over a human message (ChatOps).
+
+    Unlike an alert (one-shot, ephemeral thread), a chat is multi-turn: the
+    caller passes back the ``conversation_id`` we return to keep the same Foundry
+    thread, so the assistant remembers the conversation. Returns
+    ``{"reply": str, "conversation_id": str}`` or ``None`` on hard failure.
+    """
+    try:
+        client = _client()
+        agent_id = _chat_coordinator_id()
+        # Reuse the caller's thread when given; otherwise start a fresh one.
+        if conversation_id:
+            thread_id = conversation_id
+        else:
+            thread_id = client.agents.threads.create().id
+
+        client.agents.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=(message or "")[:4000],
+        )
+        run = client.agents.runs.create_and_process(
+            thread_id=thread_id,
+            agent_id=agent_id,
+        )
+        if run.status == "failed":
+            logging.error("agent_chat_failed_run %s", getattr(run, "last_error", None))
+            return {
+                "reply": "Sorry, I hit an error processing that. Please try again.",
+                "conversation_id": thread_id,
+            }
+        messages = client.agents.messages.list(
+            thread_id=thread_id,
+            order=ListSortOrder.ASCENDING,
+        )
+        reply = _extract_answer(messages) or "(no reply)"
+        # The chat thread is intentionally kept alive for conversation continuity.
+        return {"reply": reply, "conversation_id": thread_id}
+    except Exception:
+        logging.exception("agent_chat_failed")
         return None

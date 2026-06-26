@@ -101,3 +101,69 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
         mimetype="application/json",
     )
+
+
+@app.route(route="chat", methods=["POST"])
+def chat(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/chat — ChatOps front door: a human talks to the agent fleet.
+
+    A second entry point into the same coordinator brain (the first is the alert
+    webhook). The request carries a free-text ``message`` and, on follow-up
+    turns, the ``conversation_id`` we returned previously so the assistant keeps
+    its context. Protected by a shared-secret header (``X-Chat-Token``), falling
+    back to the alert secret so it works before any new app setting is added.
+    This is advisory only — the assistant cannot execute anything yet.
+    """
+
+    expected = os.environ.get("CHAT_SHARED_SECRET") or os.environ.get("ALERT_SHARED_SECRET", "")
+    presented = req.headers.get("X-Chat-Token", "")
+    if not expected:
+        logging.error("Neither CHAT_SHARED_SECRET nor ALERT_SHARED_SECRET is configured")
+        return func.HttpResponse("server misconfigured", status_code=500)
+    if presented != expected:
+        logging.warning("Rejected chat: bad/missing X-Chat-Token")
+        return func.HttpResponse("unauthorized", status_code=401)
+
+    if not os.environ.get("AZURE_AI_PROJECT_ENDPOINT"):
+        return func.HttpResponse("chat is not configured", status_code=503)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    message = (body or {}).get("message", "").strip()
+    conversation_id = (body or {}).get("conversation_id") or None
+    if not message:
+        return func.HttpResponse(
+            json.dumps({"error": "missing 'message'"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        import rca
+
+        result = rca.analyze_chat(message, conversation_id)
+    except Exception:
+        logging.exception("chat_unavailable")
+        result = None
+
+    if not result:
+        return func.HttpResponse(
+            json.dumps({"error": "chat temporarily unavailable"}),
+            status_code=502,
+            mimetype="application/json",
+        )
+
+    logging.info(
+        "chat_turn %s",
+        json.dumps(
+            {"conversation_id": result.get("conversation_id"), "message": message[:500]},
+            default=str,
+        ),
+    )
+    return func.HttpResponse(
+        json.dumps(result),
+        status_code=200,
+        mimetype="application/json",
+    )

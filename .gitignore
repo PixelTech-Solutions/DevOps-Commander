@@ -25,3 +25,5 @@ obj/
 .idea/
 *.swp
 .DS_Store
+
+knowledge-logs.jsonl
