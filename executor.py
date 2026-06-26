@@ -68,40 +68,47 @@ def _q_int(params: dict, name: str, *, default=None, minimum=None, maximum=None)
 # --- The allow-list. Each action declares its target host role, whether it is
 #     destructive, and a builder that returns the shell command to run. Builders
 #     only ever interpolate already-validated integers. ------------------------
+# MySQL runs as root via the credentials file ansible already places on the DB
+# box (/root/.my.cnf, mode 0600), so no DB password ever lives in the Function.
+# Run Command does not set $HOME, hence the explicit --defaults-file. Queries are
+# wrapped in `timeout` so a stuck connection can never hold the per-VM lock.
+_MYSQL = "timeout 20 mysql --defaults-file=/root/.my.cnf erpdb"
+
+
 def _count_customers(_params: dict) -> str:
-    return 'mysql erpdb -N -e "SELECT COUNT(*) AS customers FROM customers;"'
+    return f'{_MYSQL} -N -e "SELECT COUNT(*) FROM customers;" 2>&1'
 
 
 def _list_customers(params: dict) -> str:
     n = _q_int(params, "limit", default=10, minimum=1, maximum=50)
     return (
-        f'mysql --table erpdb -e "SELECT id, name, email, phone '
-        f'FROM customers ORDER BY id LIMIT {n};"'
+        f'{_MYSQL} --table -e "SELECT id, name, email, phone '
+        f'FROM customers ORDER BY id LIMIT {n};" 2>&1'
     )
 
 
 def _get_customer(params: dict) -> str:
     cid = _q_int(params, "id", minimum=1)
     return (
-        f'mysql --table erpdb -e "SELECT id, name, email, phone, address, '
-        f'created_at FROM customers WHERE id = {cid};"'
+        f'{_MYSQL} --table -e "SELECT id, name, email, phone, address, '
+        f'created_at FROM customers WHERE id = {cid};" 2>&1'
     )
 
 
 def _service_status(_params: dict) -> str:
     return (
         "echo '== erp-backend =='; systemctl is-active erp-backend; "
-        "systemctl status erp-backend --no-pager | head -n 15"
+        "systemctl status erp-backend --no-pager 2>&1 | head -n 15"
     )
 
 
 def _recent_app_logs(params: dict) -> str:
     n = _q_int(params, "lines", default=30, minimum=1, maximum=200)
-    return f"journalctl -u erp-backend -n {n} --no-pager"
+    return f"journalctl -u erp-backend -n {n} --no-pager 2>&1"
 
 
 def _disk_usage(_params: dict) -> str:
-    return "df -h /"
+    return "df -h / 2>&1"
 
 
 ACTIONS: dict[str, dict] = {
@@ -175,13 +182,22 @@ def _compute_client():
 
 def _run_on_vm(resource_group: str, vm_name: str, script: str) -> str:
     """Run a shell script as root on a VM via Azure action Run Command."""
+    from azure.core.exceptions import ResourceExistsError
+
     client = _compute_client()
-    poller = client.virtual_machines.begin_run_command(
-        resource_group_name=resource_group,
-        vm_name=vm_name,
-        parameters={"command_id": "RunShellScript", "script": [script]},
-    )
-    result = poller.result()
+    try:
+        poller = client.virtual_machines.begin_run_command(
+            resource_group_name=resource_group,
+            vm_name=vm_name,
+            parameters={"command_id": "RunShellScript", "script": [script]},
+        )
+        result = poller.result()
+    except ResourceExistsError:
+        # Run Command serializes one command per VM; a previous one is still
+        # running. Surface a friendly, retryable message rather than a 500.
+        raise ActionError(
+            "another action is already running on this host; try again in a moment"
+        )
     messages = [s.message for s in (result.value or []) if getattr(s, "message", None)]
     return "\n".join(messages).strip() or "(no output)"
 
