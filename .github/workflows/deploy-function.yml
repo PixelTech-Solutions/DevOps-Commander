@@ -36,19 +36,27 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Build dependencies into the package
-        # Build on ubuntu-latest (linux/x64) — the SAME platform as the Linux
-        # Consumption host — so manylinux wheels (e.g. pydantic-core, pulled in
-        # transitively by openai) are valid on the Functions worker.
+        # Vendor wheels into .python_packages so the Python v2 worker can import
+        # azure.functions and index the @app.route functions (server-side Oryx
+        # build is disabled below).
         #
-        # Shipping .python_packages lets the Python v2 worker import
-        # azure.functions and index the @app.route functions. Previously the
-        # functions-action "remote Oryx build" set WEBSITE_RUN_FROM_PACKAGE to
-        # an UN-built zip, so pip never ran, the worker could not import
-        # azure.functions, and it indexed 0 functions -> /api/health 404.
+        # IMPORTANT: target manylinux2014 (glibc 2.17) cp311 wheels explicitly.
+        # ubuntu-latest has a newer glibc, so a plain `pip install` grabs a
+        # cryptography wheel whose Rust binding needs GLIBC_2.33 — which the
+        # Functions Linux Consumption host lacks, causing an ImportError when
+        # azure-ai-projects -> azure-storage-blob -> cryptography is imported.
         run: |
           python -m pip install --upgrade pip
           python -m py_compile function_app.py rca.py
-          pip install --target=".python_packages/lib/site-packages" -r requirements.txt
+          pip install \
+            --target=".python_packages/lib/site-packages" \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --abi cp311 \
+            --only-binary=:all: \
+            --upgrade \
+            -r requirements.txt
 
       - name: Azure login (service principal)
         uses: azure/login@v2
