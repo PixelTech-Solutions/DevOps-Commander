@@ -1,15 +1,21 @@
-"""Root-cause analysis via the Azure AI Foundry Agent Service.
+"""DevOps Commander multi-agent fleet (Foundry Agent Service, Connected Agents).
 
-This is the first agent of the DevOps Commander fleet. It uses the GA Foundry
-Agent Service (a persistent agent + threads + runs) through the
-azure-ai-projects SDK, authenticated keyless with the Function App's
-user-assigned managed identity (granted the Foundry User role on the project).
-No API key is read or stored. AZURE_CLIENT_ID (an app setting) tells the
-credential which user-assigned identity to use.
+A coordinator agent receives each alert and delegates to specialist agents that
+are registered as its tools (the Connected Agents pattern). The coordinator
+decides the order in natural language; no hand-coded routing.
 
-A single persistent agent ("devops-commander-rca") is created once and reused
-across invocations. Each alert gets its own thread (one incident = one
-conversation) so analyses never bleed into each other.
+  coordinator (devops-commander-coordinator)
+    ├─ diagnose_incident   -> devops-commander-rca         (root cause + severity)
+    └─ propose_remediation -> devops-commander-remediation (safe fix + risk flag)
+
+Everything runs server-side on the Foundry project, authenticated keyless with
+the Function App's user-assigned managed identity (Foundry User role). No API
+key is read or stored. AZURE_CLIENT_ID (an app setting) selects the identity.
+
+Each alert gets its own thread (one incident = one conversation). Sub-agents are
+created once and reused across cold starts (looked up by name), so they never
+pile up as duplicates. Connected-agent replies are visible only to the
+coordinator, which compiles the final report returned to the caller.
 """
 
 from __future__ import annotations
@@ -19,21 +25,47 @@ import logging
 import os
 from functools import lru_cache
 
-from azure.ai.agents.models import ListSortOrder, MessageRole
+from azure.ai.agents.models import ConnectedAgentTool, ListSortOrder, MessageRole
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
 
-_AGENT_NAME = "devops-commander-rca"
+# --- Specialist agents (the "tools" the coordinator delegates to) ------------
+_DIAGNOSE_NAME = "devops-commander-rca"
+_DIAGNOSE_TOOL = "diagnose_incident"
+_DIAGNOSE_INSTRUCTIONS = (
+    "You are the diagnosis specialist for a multi-cloud ERP (Azure + AWS). "
+    "Given a monitoring alert, identify the single most likely root cause and "
+    "its severity. Reply with exactly two short lines:\n"
+    "Root cause: <one sentence>\n"
+    "Severity: <low|medium|high|critical>"
+)
 
-_INSTRUCTIONS = (
-    "You are DevOps Commander, an SRE incident assistant for a multi-cloud ERP "
-    "system running on Azure and AWS. Given a single monitoring alert, reply with "
-    "exactly three short lines:\n"
-    "Root cause: <one sentence, most likely cause>\n"
+_REMEDIATION_NAME = "devops-commander-remediation"
+_REMEDIATION_TOOL = "propose_remediation"
+_REMEDIATION_INSTRUCTIONS = (
+    "You are the remediation specialist for a multi-cloud ERP (Azure + AWS). "
+    "Given a diagnosed incident (root cause + severity), propose the safest "
+    "concrete fix. Reply with exactly three short lines:\n"
+    "Proposed fix: <one sentence describing the action>\n"
+    "Command: <the single command or playbook step to run>\n"
+    "Approval: <auto-safe | needs-human>  (use needs-human for anything "
+    "destructive, stateful, or production-impacting; never recommend running "
+    "destructive actions without human approval)."
+)
+
+# --- Coordinator (the "main" agent the Function talks to) --------------------
+_COORDINATOR_NAME = "devops-commander-coordinator"
+_COORDINATOR_INSTRUCTIONS = (
+    "You are DevOps Commander, the incident coordinator for a multi-cloud ERP. "
+    "For each alert: first call diagnose_incident to get the root cause and "
+    "severity, then call propose_remediation to get a safe fix for that "
+    "diagnosis. Then compile ONE final report with exactly these lines:\n"
+    "Root cause: ...\n"
     "Severity: <low|medium|high|critical>\n"
-    "Next command: <one concrete diagnostic command to run>\n"
-    "Be concise and concrete. If the alert is ambiguous, state the one extra "
-    "signal you would check."
+    "Proposed fix: ...\n"
+    "Command: ...\n"
+    "Approval: <auto-safe | needs-human>\n"
+    "Do not execute anything yourself. Be concise and concrete."
 )
 
 
@@ -50,24 +82,51 @@ def _client() -> AIProjectClient:
     )
 
 
-@lru_cache(maxsize=1)
-def _agent_id() -> str:
-    """Return the RCA agent's id, creating it once if it doesn't exist.
+def _model() -> str:
+    return os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
-    Reuses an agent with our well-known name when present so repeated cold
-    starts don't pile up duplicate agents in the project.
+
+def _ensure_agent(name: str, instructions: str, tools=None) -> str:
+    """Get-or-create an agent by name; return its id.
+
+    Looking up by our well-known name keeps cold starts from piling up
+    duplicate agents in the project.
     """
     client = _client()
     for agent in client.agents.list_agents():
-        if agent.name == _AGENT_NAME:
+        if agent.name == name:
             return agent.id
-    model = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
     created = client.agents.create_agent(
-        model=model,
-        name=_AGENT_NAME,
-        instructions=_INSTRUCTIONS,
+        model=_model(),
+        name=name,
+        instructions=instructions,
+        tools=tools or [],
     )
     return created.id
+
+
+@lru_cache(maxsize=1)
+def _coordinator_id() -> str:
+    """Ensure the two specialists + the coordinator exist; return coordinator id.
+
+    The coordinator is created with the specialists wired in as Connected Agent
+    tools, so it can delegate to them by name at runtime.
+    """
+    diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
+    remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
+
+    diagnose_tool = ConnectedAgentTool(
+        id=diagnose_id,
+        name=_DIAGNOSE_TOOL,
+        description="Diagnose the root cause and severity of an incident from its alert.",
+    )
+    remediation_tool = ConnectedAgentTool(
+        id=remediation_id,
+        name=_REMEDIATION_TOOL,
+        description="Propose a safe, concrete fix and command for a diagnosed incident, flagging whether human approval is required.",
+    )
+    tools = diagnose_tool.definitions + remediation_tool.definitions
+    return _ensure_agent(_COORDINATOR_NAME, _COORDINATOR_INSTRUCTIONS, tools=tools)
 
 
 def _build_user_message(event: dict) -> str:
@@ -78,7 +137,7 @@ def _build_user_message(event: dict) -> str:
 
 
 def _extract_answer(messages) -> str | None:
-    """Return the text of the most recent assistant message, or None."""
+    """Return the text of the most recent assistant (coordinator) message."""
     answer = None
     for message in messages:
         if message.role != MessageRole.AGENT:
@@ -92,14 +151,15 @@ def _extract_answer(messages) -> str | None:
 
 
 def analyze_alert(event: dict) -> str | None:
-    """Run the RCA agent over an alert and return its analysis, or None.
+    """Run the coordinator over an alert and return its compiled report, or None.
 
-    Best-effort: any error is logged and swallowed so the caller can still
-    acknowledge the webhook.
+    The coordinator delegates to the diagnosis and remediation specialists and
+    returns one combined report. Best-effort: any error is logged and swallowed
+    so the caller can still acknowledge the webhook.
     """
     try:
         client = _client()
-        agent_id = _agent_id()
+        coordinator_id = _coordinator_id()
         thread = client.agents.threads.create()
         try:
             client.agents.messages.create(
@@ -109,7 +169,7 @@ def analyze_alert(event: dict) -> str | None:
             )
             run = client.agents.runs.create_and_process(
                 thread_id=thread.id,
-                agent_id=agent_id,
+                agent_id=coordinator_id,
             )
             if run.status == "failed":
                 logging.error("agent_run_failed %s", getattr(run, "last_error", None))
