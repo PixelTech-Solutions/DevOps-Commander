@@ -11,12 +11,12 @@ env:
   PYTHON_VERSION: "3.11"
 
 jobs:
-  deploy:
-    name: Build and deploy
+  # 1) Fast pre-flight gate — fail in seconds if the deploy target is missing,
+  #    before spending time building wheels or logging into Azure.
+  precheck:
+    name: Pre-flight checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Validate FUNCTION_APP_NAME is set
         env:
           FUNCTION_APP_NAME: ${{ vars.FUNCTION_APP_NAME }}
@@ -28,17 +28,27 @@ jobs:
                  "Settings > Variables > New repository variable."
             exit 1
           fi
-          echo "Deploying to $FUNCTION_APP_NAME"
+          echo "Will deploy to $FUNCTION_APP_NAME"
+
+  # 2) Build the deployment package: compile the source and vendor the Linux
+  #    wheels into .python_packages, then hand it to the deploy job as an
+  #    artifact so the deploy runner never rebuilds anything.
+  build:
+    name: Build package
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Build dependencies into the package
+      - name: Compile + vendor dependencies into the package
         # Vendor wheels into .python_packages so the Python v2 worker can import
         # azure.functions and index the @app.route functions (server-side Oryx
-        # build is disabled below).
+        # build is disabled in the deploy job).
         #
         # IMPORTANT: target manylinux2014 (glibc 2.17) cp311 wheels explicitly.
         # ubuntu-latest has a newer glibc, so a plain `pip install` grabs a
@@ -58,6 +68,35 @@ jobs:
             --upgrade \
             -r requirements.txt
 
+      - name: Upload deployment package
+        uses: actions/upload-artifact@v4
+        with:
+          name: function-package
+          # .python_packages and .funcignore are hidden; v4 skips hidden files
+          # unless this is set, which would ship a package with no dependencies.
+          include-hidden-files: true
+          retention-days: 1
+          path: |
+            function_app.py
+            rca.py
+            host.json
+            requirements.txt
+            .funcignore
+            .python_packages/
+            tools/
+
+  # 3) Deploy the pre-built package and force a function re-index, then confirm
+  #    the host discovered the functions.
+  deploy:
+    name: Deploy to Azure
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment package
+        uses: actions/download-artifact@v4
+        with:
+          name: function-package
+
       - name: Azure login (service principal)
         uses: azure/login@v2
         with:
@@ -74,13 +113,13 @@ jobs:
         with:
           app-name: ${{ vars.FUNCTION_APP_NAME }}
           package: .
-          # Dependencies are already vendored into .python_packages above, so
-          # the platform must NOT rebuild. This is the recommended GitHub
-          # Actions pattern for Python on Linux Consumption.
+          # Dependencies are already vendored into .python_packages, so the
+          # platform must NOT rebuild. This is the recommended GitHub Actions
+          # pattern for Python on Linux Consumption.
           scm-do-build-during-deployment: false
           enable-oryx-build: false
 
-      - name: Diagnose Function App (settings + restart + discovered functions)
+      - name: Restart + confirm discovered functions
         run: |
           APP="${{ vars.FUNCTION_APP_NAME }}"
           RG="$(az functionapp list --query "[?name=='$APP'].resourceGroup | [0]" -o tsv)"
@@ -105,6 +144,13 @@ jobs:
           echo "----- discovered functions (after restart) -----"
           az functionapp function list -g "$RG" -n "$APP" -o table || echo "(none discovered)"
 
+  # 4) Independent verification that the deployed app actually serves traffic.
+  #    Public HTTP only — no Azure credentials needed in this job.
+  smoke-test:
+    name: Smoke test
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
       - name: Smoke test /api/health
         run: |
           url="https://${{ vars.FUNCTION_APP_NAME }}.azurewebsites.net/api/health"
