@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 
+import rca
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
@@ -68,8 +70,19 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
     #   traces | where message startswith "alert_received "
     logging.info("alert_received %s", json.dumps(event, default=str))
 
+    # Single-agent MVP: ask GPT-4o for a root-cause analysis (keyless).
+    # Best-effort — a model failure must not stop us acknowledging the webhook.
+    rca_text = None
+    if rca.is_enabled():
+        rca_text = rca.analyze_alert(event)
+        if rca_text:
+            logging.info(
+                "alert_rca %s",
+                json.dumps({"source": source, "analysis": rca_text}, default=str),
+            )
+
     return func.HttpResponse(
-        json.dumps({"status": "accepted", "source": source}),
+        json.dumps({"status": "accepted", "source": source, "rca": rca_text}),
         status_code=202,
         mimetype="application/json",
     )
