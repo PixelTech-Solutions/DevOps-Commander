@@ -35,15 +35,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install dependencies into deployment package
-        # Linux Consumption + RBAC deploys bypass Kudu/Oryx, so requirements.txt
-        # is NOT auto-installed on the Function App. We must bundle the deps
-        # into .python_packages/lib/site-packages/ — that's the path the
-        # Python worker prepends to sys.path at startup.
+      - name: Syntax check
+        # Compile-only check; no imports needed. Dependencies are installed on
+        # the server by the Oryx remote build (see deploy step below).
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
-          python -m py_compile function_app.py
+          python -m py_compile function_app.py rca.py
 
       - name: Azure login (service principal)
         uses: azure/login@v2
@@ -56,14 +53,18 @@ jobs:
               "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}"
             }
 
-      - name: Deploy to Azure Functions
+      - name: Deploy to Azure Functions (remote Oryx build)
         uses: Azure/functions-action@v1
         with:
           app-name: ${{ vars.FUNCTION_APP_NAME }}
           package: .
-          # Remote build is skipped anyway on Y1 Linux + RBAC, so leave these off.
-          scm-do-build-during-deployment: false
-          enable-oryx-build: false
+          # Let the platform build: Oryx runs `pip install -r requirements.txt`
+          # in the correct, isolated location so user deps never shadow the
+          # Python worker's own libraries. This is the supported path for
+          # Linux Consumption Python with compiled dependencies.
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+          remote-build: true
 
       - name: Diagnose Function App (settings + restart + discovered functions)
         run: |
