@@ -215,7 +215,7 @@ def action(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        result = executor.run_action(action_name, env, params)
+        result = executor.request_action(action_name, env, params)
     except executor.ActionError as exc:
         logging.warning("action_refused %s", json.dumps({"action": action_name, "env": env, "reason": str(exc)}))
         return func.HttpResponse(
@@ -225,6 +225,66 @@ def action(req: func.HttpRequest) -> func.HttpResponse:
         )
     except Exception:
         logging.exception("action_failed")
+        return func.HttpResponse(
+            json.dumps({"error": "action execution failed"}),
+            status_code=502,
+            mimetype="application/json",
+        )
+
+    # Destructive actions don't run yet — they return a token to approve. Use
+    # 202 Accepted so callers can distinguish "pending approval" from "done".
+    status = 202 if result.get("requires_approval") else 200
+    return func.HttpResponse(
+        json.dumps(result),
+        status_code=status,
+        mimetype="application/json",
+    )
+
+
+@app.route(route="approve", methods=["POST"])
+def approve(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/approve — spend a single-use token and run the destructive action.
+
+    The body carries the ``token`` returned by a destructive ``/api/action``
+    request. The executor verifies the signature, checks expiry, spends the
+    nonce (so it can't run twice), and only then touches the dev VM. Protected
+    by the same shared secret as the other action routes.
+    """
+
+    expected = os.environ.get("CHAT_SHARED_SECRET") or os.environ.get("ALERT_SHARED_SECRET", "")
+    presented = req.headers.get("X-Chat-Token", "")
+    if not expected:
+        logging.error("Neither CHAT_SHARED_SECRET nor ALERT_SHARED_SECRET is configured")
+        return func.HttpResponse("server misconfigured", status_code=500)
+    if presented != expected:
+        logging.warning("Rejected approve: bad/missing X-Chat-Token")
+        return func.HttpResponse("unauthorized", status_code=401)
+
+    import executor
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+    token = ((body or {}).get("token") or "").strip()
+    if not token:
+        return func.HttpResponse(
+            json.dumps({"error": "missing 'token'"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        result = executor.approve_and_run(token)
+    except executor.ActionError as exc:
+        logging.warning("approval_refused %s", json.dumps({"reason": str(exc)}))
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    except Exception:
+        logging.exception("approval_failed")
         return func.HttpResponse(
             json.dumps({"error": "action execution failed"}),
             status_code=502,
