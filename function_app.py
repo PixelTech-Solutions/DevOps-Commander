@@ -94,7 +94,7 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def health(_req: func.HttpRequest) -> func.HttpResponse:
+def health(req: func.HttpRequest) -> func.HttpResponse:
     """GET /api/health — liveness probe (no auth)."""
     return func.HttpResponse(
         json.dumps({"status": "ok", "service": "devops-commander-alert-receiver"}),
