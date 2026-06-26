@@ -6,7 +6,12 @@ decides the order in natural language; no hand-coded routing.
 
   coordinator (devops-commander-coordinator)
     ├─ diagnose_incident   -> devops-commander-rca         (root cause + severity)
-    └─ propose_remediation -> devops-commander-remediation (safe fix + risk flag)
+    ├─ propose_remediation -> devops-commander-remediation (safe fix + command)
+    └─ assess_risk         -> devops-commander-risk        (independent approval verdict)
+
+After the agents reply, a deterministic CODE gate (_enforce_gate) has the FINAL
+say on whether a fix may proceed automatically or must be held for a human. The
+model proposes; the code disposes — an agent can never approve its own action.
 
 Everything runs server-side on the Foundry project, authenticated keyless with
 the Function App's user-assigned managed identity (Foundry User role). No API
@@ -53,19 +58,37 @@ _REMEDIATION_INSTRUCTIONS = (
     "destructive actions without human approval)."
 )
 
+_RISK_NAME = "devops-commander-risk"
+_RISK_TOOL = "assess_risk"
+_RISK_INSTRUCTIONS = (
+    "You are the risk and approval reviewer for a multi-cloud ERP (Azure + AWS). "
+    "You are INDEPENDENT from whoever proposed the fix — never rubber-stamp it. "
+    "Given a proposed fix and its command, judge how dangerous it is to run in "
+    "production. Reply with exactly two short lines:\n"
+    "Risk: <low|medium|high>\n"
+    "Verdict: <auto-safe | needs-human>\n"
+    "Treat anything destructive, stateful, data-affecting, restart/scaling, or "
+    "production-impacting as needs-human. Only genuinely low-risk, read-only or "
+    "trivially reversible actions may be auto-safe."
+)
+
 # --- Coordinator (the "main" agent the Function talks to) --------------------
 _COORDINATOR_NAME = "devops-commander-coordinator"
 _COORDINATOR_INSTRUCTIONS = (
     "You are DevOps Commander, the incident coordinator for a multi-cloud ERP. "
-    "For each alert: first call diagnose_incident to get the root cause and "
-    "severity, then call propose_remediation to get a safe fix for that "
-    "diagnosis. Then compile ONE final report with exactly these lines:\n"
+    "For each alert: (1) call diagnose_incident to get the root cause and "
+    "severity, (2) call propose_remediation to get a safe fix for that "
+    "diagnosis, (3) call assess_risk to get an INDEPENDENT risk review of that "
+    "fix. Then compile ONE final report with exactly these lines:\n"
     "Root cause: ...\n"
     "Severity: <low|medium|high|critical>\n"
     "Proposed fix: ...\n"
     "Command: ...\n"
+    "Risk: <low|medium|high>\n"
     "Approval: <auto-safe | needs-human>\n"
-    "Do not execute anything yourself. Be concise and concrete."
+    "Use the independent risk reviewer's verdict for the Approval line; if the "
+    "reviewer and the remediation agent disagree, always choose the safer one "
+    "(needs-human). Do not execute anything yourself. Be concise and concrete."
 )
 
 
@@ -107,13 +130,14 @@ def _ensure_agent(name: str, instructions: str, tools=None) -> str:
 
 @lru_cache(maxsize=1)
 def _coordinator_id() -> str:
-    """Ensure the two specialists + the coordinator exist; return coordinator id.
+    """Ensure the three specialists + the coordinator exist; return coordinator id.
 
     The coordinator is created with the specialists wired in as Connected Agent
     tools, so it can delegate to them by name at runtime.
     """
     diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
     remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
+    risk_id = _ensure_agent(_RISK_NAME, _RISK_INSTRUCTIONS)
 
     diagnose_tool = ConnectedAgentTool(
         id=diagnose_id,
@@ -125,8 +149,49 @@ def _coordinator_id() -> str:
         name=_REMEDIATION_TOOL,
         description="Propose a safe, concrete fix and command for a diagnosed incident, flagging whether human approval is required.",
     )
-    tools = diagnose_tool.definitions + remediation_tool.definitions
+    risk_tool = ConnectedAgentTool(
+        id=risk_id,
+        name=_RISK_TOOL,
+        description="Independently review a proposed fix and command, rate its risk, and decide whether human approval is required before it may run.",
+    )
+    tools = (
+        diagnose_tool.definitions
+        + remediation_tool.definitions
+        + risk_tool.definitions
+    )
     return _ensure_agent(_COORDINATOR_NAME, _COORDINATOR_INSTRUCTIONS, tools=tools)
+
+
+# A deterministic, code-side human-in-the-loop gate. The agents only advise;
+# this function -- not the model -- decides whether a fix may run automatically.
+# Any of these substrings in the proposed command marks it as sensitive.
+_SENSITIVE_OPS = (
+    "rm ", "rm -", "drop ", "delete", "truncate", "restart", "reboot",
+    "kill", "stop ", "terminate", "scale", "rollout", "rollback",
+    "failover", "shutdown", "systemctl", "format", "chmod", "chown",
+)
+
+
+def _enforce_gate(report: str) -> tuple[str, str]:
+    """Deterministic human-in-the-loop gate -- code, not the model, has final say.
+
+    Returns (decision, reason). HOLD means a human must approve before anything
+    runs; AUTO-APPROVED means the action is low-risk and reversible. Because
+    nothing is executed yet, this only classifies and records the decision -- but
+    it is the same gate a later execution step will obey.
+    """
+    text = report.lower()
+    # 1. If any agent already asked for a human, honor it unconditionally.
+    if "needs-human" in text:
+        return "HOLD", "an agent flagged the fix as needs-human"
+    # 2. Independently scan the proposed command for sensitive operations.
+    for op in _SENSITIVE_OPS:
+        if op in text:
+            return "HOLD", f"command contains a sensitive operation ('{op.strip()}')"
+    # 3. High/critical incidents always get a human, even for a 'safe' command.
+    if "severity: high" in text or "severity: critical" in text:
+        return "HOLD", "high/critical severity requires human sign-off"
+    return "AUTO-APPROVED", "low-risk, reversible action"
 
 
 def _build_user_message(event: dict) -> str:
@@ -153,9 +218,10 @@ def _extract_answer(messages) -> str | None:
 def analyze_alert(event: dict) -> str | None:
     """Run the coordinator over an alert and return its compiled report, or None.
 
-    The coordinator delegates to the diagnosis and remediation specialists and
-    returns one combined report. Best-effort: any error is logged and swallowed
-    so the caller can still acknowledge the webhook.
+    The coordinator delegates to the diagnosis, remediation, and risk specialists
+    and returns one combined report; a deterministic code gate then appends the
+    final HOLD / AUTO-APPROVED decision. Best-effort: any error is logged and
+    swallowed so the caller can still acknowledge the webhook.
     """
     try:
         client = _client()
@@ -178,7 +244,12 @@ def analyze_alert(event: dict) -> str | None:
                 thread_id=thread.id,
                 order=ListSortOrder.ASCENDING,
             )
-            return _extract_answer(messages)
+            report = _extract_answer(messages)
+            if report:
+                # Code has the final say on whether a human is needed.
+                decision, reason = _enforce_gate(report)
+                report = f"{report}\nGate (enforced in code): {decision} — {reason}"
+            return report
         finally:
             # One incident = one thread; clean it up so the project stays tidy.
             try:
