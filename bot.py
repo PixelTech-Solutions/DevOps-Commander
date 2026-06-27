@@ -16,12 +16,14 @@ import os
 
 from botbuilder.core import (
     ActivityHandler,
-    CloudAdapterBase,
     MessageFactory,
     TurnContext,
 )
+from botbuilder.integration.aiohttp import (
+    CloudAdapter,
+    ConfigurationBotFrameworkAuthentication,
+)
 from botbuilder.schema import Activity, ChannelAccount
-from botframework.connector.auth import ConfigurationBotFrameworkAuthentication
 
 
 class _BotConfig:
@@ -38,8 +40,12 @@ class _BotConfig:
     APP_TENANTID = os.environ.get("MicrosoftAppTenantId", "")
 
 
-class _FunctionsCloudAdapter(CloudAdapterBase):
-    """A CloudAdapter usable from an Azure Function (no aiohttp web server)."""
+class _FunctionsCloudAdapter(CloudAdapter):
+    """A CloudAdapter usable from an Azure Function (no aiohttp web server).
+
+    ``CloudAdapter.process_activity(auth_header, activity, logic)`` works without
+    an aiohttp request object, so the Function route can call it directly.
+    """
 
     def __init__(self) -> None:
         super().__init__(ConfigurationBotFrameworkAuthentication(_BotConfig()))
