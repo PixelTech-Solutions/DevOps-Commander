@@ -34,8 +34,10 @@ from azure.ai.agents.models import (
     AzureAISearchQueryType,
     AzureAISearchTool,
     ConnectedAgentTool,
+    FunctionTool,
     ListSortOrder,
     MessageRole,
+    ToolSet,
 )
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
@@ -153,13 +155,89 @@ _CHAT_INSTRUCTIONS = (
     "When the user reports a PROBLEM to troubleshoot, you may also delegate: "
     "call diagnose_incident for the root cause, propose_remediation for a safe "
     "fix, and assess_risk for an independent risk opinion.\n"
-    "You cannot execute anything yet — never claim to have run a command or "
-    "changed a system. If the user asks you to perform an action (for example "
-    "deleting a record or restarting a service), explain exactly what the "
-    "action would be, which environment and host it targets, and that it must "
-    "go through the approval gate before anything runs. Be concise, friendly, "
-    "and concrete."
+    "You CAN run a small set of READ-ONLY actions against the DEVELOPMENT "
+    "environment directly, using your tools: count the customers, list "
+    "customers, look up one customer by id, check whether the erp-backend "
+    "service is running, read recent app logs, and check disk usage. When the "
+    "user asks to SEE or FETCH this live development data, actually CALL the "
+    "matching tool and report the real result — do not merely explain how to "
+    "do it, and do not ask for database credentials (the tools run safely on "
+    "the dev VM with no secrets exposed).\n"
+    "You CANNOT run destructive actions (deleting a customer, restarting a "
+    "service) and you CANNOT touch PRODUCTION. If the user asks for either, "
+    "explain exactly what the action would be, which environment and host it "
+    "targets, and that it must go through the approval gate (request it, then "
+    "a human approves) before anything runs. Never claim to have performed a "
+    "destructive or production action. Be concise, friendly, and concrete."
 )
+
+
+# --- Live read-only actions the chat agent may call directly (ChatOps) --------
+# These wrap the dev-only executor and are exposed to the chat model as function
+# tools. ONLY non-destructive actions are exposed; destructive ones still go
+# through the signed approval gate and are never callable from chat. Each returns
+# a short text result the agent reads back to the user.
+def _dev_action(action: str, params: dict | None = None) -> str:
+    import executor
+
+    try:
+        result = executor.run_action(action, "dev", params or {})
+    except executor.ActionError as exc:
+        return f"Could not run {action} on dev: {exc}"
+    except Exception:
+        logging.exception("chat_dev_action_failed %s", action)
+        return f"Could not run {action} on dev: an internal error occurred."
+    return str(result.get("output", "")).strip() or "(no output)"
+
+
+def count_dev_customers() -> str:
+    """Count the rows in the development ERP customers table."""
+    return _dev_action("count_customers")
+
+
+def list_dev_customers(limit: int = 10) -> str:
+    """List customers from the development ERP database.
+
+    :param limit: How many customers to return (1-50). Defaults to 10.
+    """
+    return _dev_action("list_customers", {"limit": limit})
+
+
+def get_dev_customer(customer_id: int) -> str:
+    """Show one development ERP customer by id.
+
+    :param customer_id: The customer id to look up (>= 1).
+    """
+    return _dev_action("get_customer", {"id": customer_id})
+
+
+def dev_service_status() -> str:
+    """Show whether the erp-backend service is running on the dev app server."""
+    return _dev_action("service_status")
+
+
+def dev_recent_app_logs(lines: int = 30) -> str:
+    """Show recent erp-backend logs from the dev app server.
+
+    :param lines: How many log lines to return (1-200). Defaults to 30.
+    """
+    return _dev_action("recent_app_logs", {"lines": lines})
+
+
+def dev_disk_usage() -> str:
+    """Show root filesystem disk usage on the dev app server."""
+    return _dev_action("disk_usage")
+
+
+# The set of read-only functions the chat coordinator may invoke directly.
+_CHAT_FUNCTIONS = {
+    count_dev_customers,
+    list_dev_customers,
+    get_dev_customer,
+    dev_service_status,
+    dev_recent_app_logs,
+    dev_disk_usage,
+}
 
 
 def is_enabled() -> bool:
@@ -312,12 +390,31 @@ def _chat_coordinator_id() -> str:
     if search is not None:
         tools = search.definitions + tools
         tool_resources = search.resources
-    return _ensure_agent(
+    # Expose the dev-only read-only executor actions as live function tools, but
+    # only when the executor is configured to reach Azure. The SDK runs these
+    # implementations automatically (enable_auto_function_calls) during
+    # create_and_process, so the chat agent can fetch real data, not just talk.
+    functions = None
+    try:
+        import executor
+
+        executor_ready = executor.is_enabled()
+    except Exception:
+        executor_ready = False
+    if executor_ready:
+        functions = FunctionTool(functions=_CHAT_FUNCTIONS)
+        tools = tools + functions.definitions
+    agent_id = _ensure_agent(
         _CHAT_COORDINATOR_NAME,
         _CHAT_INSTRUCTIONS,
         tools=tools,
         tool_resources=tool_resources,
     )
+    if functions is not None:
+        toolset = ToolSet()
+        toolset.add(functions)
+        _client().agents.enable_auto_function_calls(toolset)
+    return agent_id
 
 
 # A deterministic, code-side human-in-the-loop gate. The agents only advise;
