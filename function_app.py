@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.request
+import uuid
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -296,3 +298,143 @@ def approve(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200,
         mimetype="application/json",
     )
+
+
+@app.route(route="messages", methods=["POST"])
+async def messages(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/messages — Bot Framework endpoint for the Web Chat channel.
+
+    This is the protocol edge the Azure Bot resource points its messaging
+    endpoint at. Authentication is handled inside the Bot Framework SDK using
+    the Function's user-assigned managed identity (secretless), so there is no
+    shared-secret check here. The bot forwards the user's text to the same
+    coordinator brain as ``/api/chat``.
+    """
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("expected a JSON activity", status_code=400)
+
+    auth_header = req.headers.get("Authorization", "")
+    try:
+        import bot
+
+        invoke_response = await bot.process(body, auth_header)
+    except PermissionError:
+        logging.warning("Rejected message: failed Bot Framework authentication")
+        return func.HttpResponse("unauthorized", status_code=401)
+    except Exception:
+        logging.exception("messages_failed")
+        return func.HttpResponse("bot error", status_code=500)
+
+    if invoke_response:
+        return func.HttpResponse(
+            json.dumps(invoke_response.body, default=str),
+            status_code=invoke_response.status,
+            mimetype="application/json",
+        )
+    return func.HttpResponse(status_code=201)
+
+
+@app.route(route="directline-token", methods=["POST"])
+def directline_token(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/directline-token — mint a short-lived Direct Line token.
+
+    The Direct Line secret never leaves the server: we exchange it for a
+    conversation-scoped token that the browser uses to open Web Chat. This is
+    the recommended embedding pattern (the page never sees the secret).
+    """
+
+    secret = os.environ.get("DIRECTLINE_SECRET", "")
+    if not secret:
+        logging.error("DIRECTLINE_SECRET app setting is not configured")
+        return func.HttpResponse("server misconfigured", status_code=500)
+
+    payload = json.dumps({"user": {"id": f"dl_{uuid.uuid4().hex[:16]}"}}).encode("utf-8")
+    request = urllib.request.Request(
+        "https://directline.botframework.com/v3/directline/tokens/generate",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logging.exception("directline_token_failed")
+        return func.HttpResponse(
+            json.dumps({"error": "could not mint a Direct Line token"}),
+            status_code=502,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps({"token": data.get("token"), "expires_in": data.get("expires_in")}),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
+# Embeddable Web Chat page. It fetches a short-lived token from
+# ``/api/directline-token`` on the same host, so the Direct Line secret stays
+# server-side. BotFramework-WebChat is loaded from the official CDN.
+_WEBCHAT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DevOps Commander</title>
+  <script crossorigin="anonymous"
+          src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: 'Segoe UI', Arial, sans-serif; }
+    #app { display: flex; flex-direction: column; height: 100%; background: #f3f5f8; }
+    #header { background: #2b6cb0; color: #fff; padding: 14px 20px; font-weight: 600;
+              font-size: 18px; letter-spacing: .2px; }
+    #header span { font-weight: 400; opacity: .85; font-size: 13px; }
+    #webchat { flex: 1 1 auto; max-width: 820px; width: 100%; margin: 0 auto; }
+    #status { padding: 12px 20px; color: #c05621; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="header">DevOps Commander
+      <span>&middot; ChatOps for the ERP dev environment</span></div>
+    <div id="webchat" role="main"></div>
+    <div id="status"></div>
+  </div>
+  <script>
+    (async function () {
+      try {
+        const res = await fetch('directline-token', { method: 'POST' });
+        if (!res.ok) { throw new Error('token request failed (' + res.status + ')'); }
+        const { token } = await res.json();
+        window.WebChat.renderWebChat(
+          {
+            directLine: window.WebChat.createDirectLine({ token: token }),
+            styleOptions: {
+              botAvatarInitials: 'DC',
+              userAvatarInitials: 'You',
+              accent: '#2b6cb0'
+            }
+          },
+          document.getElementById('webchat')
+        );
+      } catch (e) {
+        document.getElementById('status').innerText =
+          'Could not start chat: ' + e.message;
+      }
+    })();
+  </script>
+</body>
+</html>"""
+
+
+@app.route(route="webchat", methods=["GET"])
+def webchat(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /api/webchat — embeddable Web Chat page for DevOps Commander."""
+    return func.HttpResponse(_WEBCHAT_HTML, status_code=200, mimetype="text/html")
