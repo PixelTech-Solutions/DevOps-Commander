@@ -8,8 +8,11 @@ azure-mgmt-compute==33.0.0
 azure-data-tables==12.5.0
 # Web Chat front end: Bot Framework endpoint (/api/messages). Runs as the
 # Function's user-assigned managed identity (UserAssignedMSI) -- no app secret.
-# 4.16.2 resolves cleanly against the pinned cryptography below (no glibc bump).
-botbuilder-core==4.16.2
+# The aiohttp integration package supplies CloudAdapter +
+# ConfigurationBotFrameworkAuthentication and pulls a compatible aiohttp
+# (3.10.5, manylinux2014/glibc 2.17). Verified to resolve cleanly with the
+# pinned cryptography==42.0.8 below (it stays at 42.0.8 -- no glibc bump).
+botbuilder-integration-aiohttp==4.16.2
 # Pin cryptography to the last release that ships manylinux2014 (glibc 2.17)
 # wheels. azure-ai-projects pulls in azure-storage-blob -> cryptography, and a
 # newer wheel's Rust binding requires GLIBC_2.33, which the Functions Linux
