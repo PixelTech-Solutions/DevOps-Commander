@@ -76,6 +76,17 @@ _REMEDIATION_INSTRUCTIONS = (
     "destructive actions without human approval)."
 )
 
+# When RAG is configured, the remediation agent grounds its fix in documented
+# runbooks and how similar incidents were resolved before.
+_REMEDIATION_RAG_SUFFIX = (
+    "\nYou also have a knowledge tool over recorded ERP knowledge: runbooks and "
+    "implementation history, the infrastructure inventory, and past incidents "
+    "with their fixes. Before proposing a fix, search it for how similar "
+    "incidents on the affected service or host were resolved and prefer a "
+    "documented procedure over an invented one. Add a fourth line citing it:\n"
+    "Evidence: <id or title of the most relevant runbook/incident, or 'none found'>"
+)
+
 _RISK_NAME = "devops-commander-risk"
 _RISK_TOOL = "assess_risk"
 _RISK_INSTRUCTIONS = (
@@ -88,6 +99,17 @@ _RISK_INSTRUCTIONS = (
     "Treat anything destructive, stateful, data-affecting, restart/scaling, or "
     "production-impacting as needs-human. Only genuinely low-risk, read-only or "
     "trivially reversible actions may be auto-safe."
+)
+
+# When RAG is configured, the risk reviewer grounds its verdict in how similar
+# actions behaved before and whether the target host is production.
+_RISK_RAG_SUFFIX = (
+    "\nYou also have a knowledge tool over recorded ERP knowledge: past "
+    "incidents and their outcomes, plus the infrastructure inventory (which "
+    "hosts are production vs development). Before rating, search it for how the "
+    "proposed command or similar actions behaved previously and whether the "
+    "target host is production. Add a third line citing it:\n"
+    "Evidence: <id or title of the most relevant record, or 'none found'>"
 )
 
 # --- Coordinator (the "main" agent the Function talks to) --------------------
@@ -218,16 +240,31 @@ def _specialist_tool_defs():
     """
     search = _search_tool()
     if search is not None:
+        # All three specialists share the same knowledge base, each with a
+        # role-specific instruction on how to use it (diagnosis -> root cause,
+        # remediation -> runbooks, risk -> prior outcomes + prod/dev inventory).
         diagnose_id = _ensure_agent(
             _DIAGNOSE_NAME,
             _DIAGNOSE_INSTRUCTIONS + _DIAGNOSE_RAG_SUFFIX,
             tools=search.definitions,
             tool_resources=search.resources,
         )
+        remediation_id = _ensure_agent(
+            _REMEDIATION_NAME,
+            _REMEDIATION_INSTRUCTIONS + _REMEDIATION_RAG_SUFFIX,
+            tools=search.definitions,
+            tool_resources=search.resources,
+        )
+        risk_id = _ensure_agent(
+            _RISK_NAME,
+            _RISK_INSTRUCTIONS + _RISK_RAG_SUFFIX,
+            tools=search.definitions,
+            tool_resources=search.resources,
+        )
     else:
         diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
-    remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
-    risk_id = _ensure_agent(_RISK_NAME, _RISK_INSTRUCTIONS)
+        remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
+        risk_id = _ensure_agent(_RISK_NAME, _RISK_INSTRUCTIONS)
 
     diagnose_tool = ConnectedAgentTool(
         id=diagnose_id,
