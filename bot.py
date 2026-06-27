@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from botbuilder.core import (
     ActivityHandler,
+    CardFactory,
     MessageFactory,
     TurnContext,
 )
@@ -24,6 +26,80 @@ from botbuilder.integration.aiohttp import (
     ConfigurationBotFrameworkAuthentication,
 )
 from botbuilder.schema import Activity, ChannelAccount
+
+
+# --- Destructive-intent detection (deterministic; the LLM never touches the
+#     destructive path). When a user clearly asks to restart the service or
+#     delete a customer, the bot itself mints the signed approval token and
+#     shows an approval card. "The model proposes; the code disposes." ---
+_RESTART_RE = re.compile(r"\brestart(?:ing|s|ed)?\b", re.I)
+_SERVICE_RE = re.compile(r"\b(?:erp[-_ ]?backend|backend|service|server|app)\b", re.I)
+_DELETE_RE = re.compile(r"\b(?:delete|remove|drop)\b", re.I)
+_CUSTOMER_ID_RE = re.compile(r"customer\D*(\d+)", re.I)
+
+
+def _detect_destructive(text: str) -> tuple[str, dict] | None:
+    """Map an explicit destructive request to (action, params), else None.
+
+    Only matches when intent is unambiguous; everything else falls through to
+    the chat coordinator. Returning a match never executes anything — it just
+    triggers the approval card, which still requires a human button click.
+    """
+    if _RESTART_RE.search(text) and _SERVICE_RE.search(text):
+        return "restart_service", {}
+    if _DELETE_RE.search(text) and "customer" in text.lower():
+        match = _CUSTOMER_ID_RE.search(text)
+        if match:
+            return "delete_customer", {"id": int(match.group(1))}
+    return None
+
+
+def _approval_card(result: dict):
+    """Build an Adaptive Card (Approve/Reject) from a ``request_action`` result.
+
+    The signed, single-use token rides inside the Approve button's submit data,
+    so clicking Approve simply hands the same token to ``approve_and_run`` — the
+    card is a friendly front door to the existing token gate, nothing more.
+    """
+    summary = result.get("summary") or "This action requires approval."
+    token = result.get("token") or ""
+    mins = max(1, int(result.get("expires_in_seconds") or 600) // 60)
+    card = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "\u26a0\ufe0f Approval required",
+                "weight": "Bolder",
+                "size": "Medium",
+                "color": "Warning",
+                "wrap": True,
+            },
+            {"type": "TextBlock", "text": summary, "wrap": True},
+            {
+                "type": "TextBlock",
+                "text": f"A human must approve this. The request expires in {mins} min.",
+                "isSubtle": True,
+                "spacing": "Small",
+                "wrap": True,
+            },
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "\u2705 Approve",
+                "data": {"kind": "approval", "decision": "approve", "token": token},
+            },
+            {
+                "type": "Action.Submit",
+                "title": "\u274c Reject",
+                "data": {"kind": "approval", "decision": "reject"},
+            },
+        ],
+    }
+    return CardFactory.adaptive_card(card)
 
 
 class _BotConfig:
@@ -74,10 +150,36 @@ class CommanderBot(ActivityHandler):
         self._threads: dict[str, str] = {}
 
     async def on_message_activity(self, turn_context: TurnContext):
-        text = (turn_context.activity.text or "").strip()
+        activity = turn_context.activity
+
+        # A tapped Approve/Reject button arrives as a message activity whose
+        # ``value`` carries our submit data (text is usually empty).
+        value = activity.value
+        if isinstance(value, dict) and value.get("kind") == "approval":
+            await self._handle_approval(turn_context, value)
+            return
+
+        text = (activity.text or "").strip()
         if not text:
             return
 
+        # An explicit destructive request never reaches the LLM: the bot mints
+        # the signed token and replies with an approval card instead.
+        try:
+            import executor
+
+            if executor.is_enabled():
+                detected = _detect_destructive(text)
+                if detected:
+                    await self._offer_approval(turn_context, *detected)
+                    return
+        except Exception:
+            logging.exception("bot_destructive_detect_failed")
+
+        await self._forward_to_agent(turn_context, text)
+
+    async def _forward_to_agent(self, turn_context: TurnContext, text: str):
+        """Send a non-destructive turn to the chat coordinator and reply."""
         convo = turn_context.activity.conversation
         convo_id = convo.id if convo else None
         thread_id = self._threads.get(convo_id) if convo_id else None
@@ -96,6 +198,69 @@ class CommanderBot(ActivityHandler):
             logging.exception("bot_chat_unavailable")
 
         await turn_context.send_activity(MessageFactory.text(reply))
+
+    async def _offer_approval(
+        self, turn_context: TurnContext, action: str, params: dict
+    ):
+        """Mint a single-use token for a destructive action and show the card."""
+        import executor
+
+        try:
+            result = executor.request_action(action, "dev", params)
+        except executor.ActionError as exc:
+            await turn_context.send_activity(
+                MessageFactory.text(f"I can't do that: {exc}")
+            )
+            return
+
+        if result.get("requires_approval"):
+            await turn_context.send_activity(
+                MessageFactory.attachment(_approval_card(result))
+            )
+            return
+
+        # Not actually destructive (allow-list changed): just report output.
+        await turn_context.send_activity(
+            MessageFactory.text(result.get("output") or "Done.")
+        )
+
+    async def _handle_approval(self, turn_context: TurnContext, value: dict):
+        """Spend a token (Approve) or discard it (Reject) from a button tap."""
+        if value.get("decision") == "reject":
+            await turn_context.send_activity(
+                MessageFactory.text("\u274c Cancelled \u2014 no action was taken.")
+            )
+            return
+
+        token = value.get("token") or ""
+        if not token:
+            await turn_context.send_activity(
+                MessageFactory.text(
+                    "That approval is missing its token. Please request the "
+                    "action again."
+                )
+            )
+            return
+
+        import executor
+
+        try:
+            result = executor.approve_and_run(token)
+        except executor.ActionError as exc:
+            await turn_context.send_activity(MessageFactory.text(f"\u274c {exc}"))
+            return
+        except Exception:
+            logging.exception("bot_approve_failed")
+            await turn_context.send_activity(
+                MessageFactory.text("\u274c Approval failed unexpectedly.")
+            )
+            return
+
+        output = (result.get("output") or "").strip() if isinstance(result, dict) else ""
+        message = "\u2705 Approved and executed."
+        if output:
+            message = f"{message}\n\n{output}"
+        await turn_context.send_activity(MessageFactory.text(message))
 
     async def on_members_added_activity(
         self, members_added: list[ChannelAccount], turn_context: TurnContext
