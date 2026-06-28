@@ -203,11 +203,20 @@ def _search_tool():
     conn_id = os.environ.get("AZURE_AI_SEARCH_CONNECTION_ID")
     if not index or not conn_id:
         return None
+    # The erp-knowledge index is keyword-only (no vector field/vectorizer), so
+    # pin query_type to "simple". The prompt-agent runtime otherwise defaults to
+    # vector_semantic_hybrid, which 400s on a non-vectorized index. Override via
+    # AZURE_AI_SEARCH_QUERY_TYPE if a vectorizer is ever added.
+    query_type = os.environ.get("AZURE_AI_SEARCH_QUERY_TYPE", "simple")
     return {
         "type": "azure_ai_search",
         "azure_ai_search": {
             "indexes": [
-                {"project_connection_id": conn_id, "index_name": index}
+                {
+                    "project_connection_id": conn_id,
+                    "index_name": index,
+                    "query_type": query_type,
+                }
             ]
         },
     }
