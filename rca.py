@@ -113,7 +113,18 @@ _CHAT_INSTRUCTIONS = (
     "explain exactly what the action would be, which environment and host it "
     "targets, and that it must go through the approval gate (a human approves "
     "before anything runs). Never claim to have performed a destructive or "
-    "production action. Be concise, friendly, and concrete."
+    "production action.\n"
+    "CRITICAL — missing data is NOT healthy. Empty query results, 'no data', a "
+    "metric that stops reporting, or a host/series that has disappeared do NOT "
+    "mean an incident is resolved. For a host that was just alerting, absent "
+    "metrics most likely mean the host is DOWN or unreachable — an outage, which "
+    "is MORE severe, not fixed. Only state that an incident is resolved when you "
+    "have POSITIVE evidence: a recent metric value that is back inside the normal "
+    "range, and cite the value and time. If telemetry is unavailable or empty, "
+    "say so explicitly ('I could not retrieve current metrics for <host> — it may "
+    "be down'), verify the specific alerting host (e.g. query whether its series "
+    "still reports in Grafana/Prometheus), and recommend the next concrete check. "
+    "Never infer health from silence. Be concise, friendly, and concrete."
 )
 
 
