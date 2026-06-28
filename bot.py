@@ -36,6 +36,49 @@ from botbuilder.schema import Activity, ChannelAccount, ConversationReference
 # Functions storage account) and replay them from the notifier. Web Chat /
 # Direct Line references are ephemeral, so only Teams turns are stored.
 _REF_TABLE = "botconversations"
+# Web Chat / Direct Line gives a fresh worker no memory of which Foundry
+# conversation a channel belongs to, and the consumption plan recycles idle
+# workers, so an in-memory map loses context after a few minutes. We persist the
+# channel-conversation -> Foundry-conversation id here so multi-turn memory
+# survives a cold start.
+_THREAD_TABLE = "botthreads"
+
+
+def _thread_table():
+    conn = os.environ.get("AzureWebJobsStorage", "")
+    if not conn:
+        return None
+    from azure.data.tables import TableServiceClient
+
+    service = TableServiceClient.from_connection_string(conn)
+    return service.create_table_if_not_exists(_THREAD_TABLE)
+
+
+def _thread_key(convo_id: str) -> str:
+    return convo_id.replace("/", "_")[:1024]
+
+
+def _load_thread(convo_id: str) -> str | None:
+    try:
+        table = _thread_table()
+        if table is None:
+            return None
+        entity = table.get_entity("chat", _thread_key(convo_id))
+        return entity.get("thread") or None
+    except Exception:  # pragma: no cover - best effort, missing row is normal
+        return None
+
+
+def _save_thread(convo_id: str, thread_id: str) -> None:
+    try:
+        table = _thread_table()
+        if table is None:
+            return
+        table.upsert_entity(
+            {"PartitionKey": "chat", "RowKey": _thread_key(convo_id), "thread": thread_id}
+        )
+    except Exception:  # pragma: no cover - best effort
+        logging.exception("bot_thread_save_failed")
 
 
 def _ref_table():
@@ -249,6 +292,12 @@ class CommanderBot(ActivityHandler):
         convo = turn_context.activity.conversation
         convo_id = convo.id if convo else None
         thread_id = self._threads.get(convo_id) if convo_id else None
+        # Fall back to the durable store when this worker is cold (in-memory map
+        # empty) so the conversation keeps its server-side memory.
+        if not thread_id and convo_id:
+            thread_id = _load_thread(convo_id)
+            if thread_id:
+                self._threads[convo_id] = thread_id
 
         reply = "Chat is temporarily unavailable. Please try again."
         pending = None
@@ -261,6 +310,8 @@ class CommanderBot(ActivityHandler):
                 new_thread = result.get("conversation_id")
                 if convo_id and new_thread:
                     self._threads[convo_id] = new_thread
+                    if new_thread != thread_id:
+                        _save_thread(convo_id, new_thread)
                 pending = result.get("pending_approval")
         except Exception:
             logging.exception("bot_chat_unavailable")
