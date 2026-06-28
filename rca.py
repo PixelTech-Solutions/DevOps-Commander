@@ -56,12 +56,15 @@ _MAX_TOOL_ITERS = 5
 _COORDINATOR_INSTRUCTIONS = (
     "You are DevOps Commander, the incident coordinator for a multi-cloud ERP "
     "(Azure + AWS). For each monitoring alert, produce ONE root-cause report.\n"
-    "You have live, read-only observability tools:\n"
-    "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
-    "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
-    "- Azure (read-only): resource inventory, Azure Monitor metrics/logs, and "
-    "resource health for the Azure-hosted ERP servers.\n"
-    "- AWS (read-only): EC2/CloudWatch host and infrastructure state for the "
+    "You have these live tools:\n"
+    "- Datadog (read-only): infrastructure/host metrics, monitors, logs, traces.\n"
+    "- Grafana Cloud (read-only): dashboards, Prometheus/Loki queries, alert "
+    "rules, incidents.\n"
+    "- Azure (manage): inventory, Azure Monitor metrics/logs, resource health, "
+    "and management actions (start/stop/restart VMs, run commands, scale) for "
+    "the Azure-hosted ERP servers.\n"
+    "- AWS (manage): EC2/SSM/CloudWatch inventory plus management actions "
+    "(start/stop/reboot instances, run commands, read logs/metrics) for the "
     "AWS-hosted ERP servers.\n"
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: past incidents, runbooks, and the infrastructure inventory "
@@ -69,9 +72,11 @@ _COORDINATOR_INSTRUCTIONS = (
     "Before answering: query Datadog and/or Grafana for the affected service or "
     "host to ground your analysis in real telemetry, and search the knowledge "
     "base for relevant prior incidents or runbooks. If the alert includes a "
-    "'Live telemetry' line, treat it as primary evidence. Use ONLY read-only "
-    "queries — never modify dashboards, monitors, or alerts, and never send "
-    "writes through any tool.\n"
+    "'Live telemetry' line, treat it as primary evidence. Keep Datadog and "
+    "Grafana read-only (never modify dashboards, monitors, or alerts). You MAY "
+    "use the Azure and AWS tools to investigate and to carry out remediation, "
+    "but anything destructive, stateful, data-affecting, or production-impacting "
+    "must be marked needs-human and not auto-run.\n"
     "Then compile ONE report with exactly these lines:\n"
     "Root cause: <one sentence>\n"
     "Severity: <low|medium|high|critical>\n"
@@ -105,13 +110,16 @@ _CHAT_INSTRUCTIONS = (
     "You are DevOps Commander, a conversational ChatOps assistant for a "
     "multi-cloud ERP (Azure + AWS) that spans development and production. A "
     "human engineer talks to you in plain language about the systems.\n"
-    "You have live, read-only observability tools:\n"
-    "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
-    "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
-    "- Azure (read-only): resource inventory, Azure Monitor metrics/logs, and "
-    "resource health for the Azure-hosted ERP servers.\n"
-    "- AWS (read-only): EC2/CloudWatch host and infrastructure state for the "
-    "AWS-hosted ERP servers.\n"
+    "You have live observability and management tools:\n"
+    "- Datadog (read-only): infrastructure/host metrics, monitors, logs, traces.\n"
+    "- Grafana Cloud (read-only): dashboards, Prometheus/Loki queries, alert "
+    "rules, incidents.\n"
+    "- Azure (manage): resource inventory, Azure Monitor metrics/logs, resource "
+    "health, and management operations (start/stop/restart VMs, run commands, "
+    "scale, config) for the Azure-hosted ERP servers.\n"
+    "- AWS (manage): EC2/SSM/CloudWatch inventory and management (start/stop/"
+    "reboot instances, run commands, read logs/metrics) for the AWS-hosted ERP "
+    "servers.\n"
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
     "host and IP), past incidents, and implementation history.\n"
@@ -120,9 +128,11 @@ _CHAT_INSTRUCTIONS = (
     "your answer in what you actually observe. For factual questions about the "
     "systems (hosts, IPs, what runs where, prior incidents), search the "
     "knowledge base FIRST and cite the record; if it genuinely has no answer, "
-    "say so plainly instead of guessing. Use ONLY read-only queries — never "
-    "modify dashboards, monitors, or alerts, and never send writes through any "
-    "tool.\n"
+    "say so plainly instead of guessing. Keep Datadog and Grafana read-only "
+    "(never modify dashboards, monitors, or alerts). You MAY use the Azure and "
+    "AWS tools to manage the servers (start/stop/restart, run commands) when the "
+    "user asks; for destructive or production-impacting actions, confirm intent "
+    "and route through the approval gate first.\n"
     "You can ALSO run a small set of READ-ONLY actions against the DEVELOPMENT "
     "environment directly via your tools: count customers, list customers, look "
     "up one customer by id, check whether the erp-backend service is running, "
@@ -179,9 +189,10 @@ def _mcp_tools() -> list:
     pairs as request headers and forbids inline ``headers``), so no secret is
     committed or placed in app settings. A server is attached only when both its
     URL and connection name are present, so the fleet degrades gracefully to
-    base reasoning when observability isn't configured. Read-only:
-    ``require_approval='never'`` keeps queries flowing, and the agent
-    instructions forbid any write tool.
+    base reasoning when observability isn't configured. Datadog and Grafana are
+    observability (read-only); the Azure and AWS servers are management-capable
+    (their connection identity carries whatever write scope the server allows).
+    ``require_approval='never'`` lets calls flow without a human round-trip.
     """
     tools: list = []
 
@@ -222,19 +233,22 @@ def _mcp_tools() -> list:
             )
         )
 
-    # Azure MCP (read-only): Azure control-plane / resource queries — inventory,
-    # Azure Monitor metrics & logs, resource health. Remote endpoint + a
-    # Custom-keys connection whose identity is scoped READ-ONLY (Reader), so any
-    # write tool is denied at the platform, not just discouraged in the prompt.
-    # The connection is optional: set AZURE_MCP_CONNECTION="" for a no-auth host.
+    # Azure MCP (manage): Azure control-plane operations for the Azure-hosted
+    # ERP — resource inventory, Azure Monitor metrics & logs, resource health,
+    # AND management actions (start/stop/restart VMs, run commands, scale,
+    # config). Remote endpoint + a Custom-keys connection whose identity carries
+    # the write RBAC the server is allowed to use. The connection is optional:
+    # set AZURE_MCP_CONNECTION="" for a no-auth host.
     az_url = os.environ.get("AZURE_MCP_URL")
     if az_url:
         az_kwargs = {
             "server_label": "azure",
             "server_url": az_url,
             "server_description": (
-                "Azure (read-only): resource inventory, Azure Monitor "
-                "metrics/logs, and resource health for the Azure-hosted ERP."
+                "Azure (manage): resource inventory, Azure Monitor metrics/logs, "
+                "resource health, and management operations — start/stop/restart "
+                "VMs, run commands, scale, and update config — for the "
+                "Azure-hosted ERP."
             ),
             "require_approval": "never",
         }
@@ -243,18 +257,20 @@ def _mcp_tools() -> list:
             az_kwargs["project_connection_id"] = az_conn
         tools.append(MCPTool(**az_kwargs))
 
-    # AWS MCP (read-only): the AWS-managed remote MCP (IAM-scoped, CloudTrail-
-    # audited) or the no-auth AWS Knowledge MCP, covering the AWS half of the
-    # ERP (e.g. erp-aws-app-server-dev) that Azure tools can't see. Same remote
-    # pattern; set AWS_MCP_CONNECTION="" for the no-auth Knowledge endpoint.
+    # AWS MCP (manage): the AWS-managed remote MCP (IAM-scoped, CloudTrail-
+    # audited) covering the AWS half of the ERP (e.g. erp-aws-app-server-dev)
+    # that Azure tools can't see — EC2/SSM/CloudWatch inventory AND management
+    # (start/stop/reboot instances, run commands, read logs/metrics). Same
+    # remote pattern; set AWS_MCP_CONNECTION="" for a no-auth endpoint.
     aws_url = os.environ.get("AWS_MCP_URL")
     if aws_url:
         aws_kwargs = {
             "server_label": "aws",
             "server_url": aws_url,
             "server_description": (
-                "AWS (read-only): EC2/CloudWatch host and infrastructure state "
-                "for the AWS-hosted ERP servers."
+                "AWS (manage): EC2/SSM/CloudWatch inventory and management — "
+                "start/stop/reboot instances, run commands, and read "
+                "logs/metrics — for the AWS-hosted ERP servers."
             ),
             "require_approval": "never",
         }
