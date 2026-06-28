@@ -538,6 +538,29 @@ def _build_user_message(event: dict) -> str:
     return f"Alert source: {source}\nAlert payload:\n{body}"
 
 
+def _fallback_report(event: dict) -> str:
+    """A minimal, gate-able report used when the RCA agent cannot complete.
+
+    A human notification must never depend on a flawless agent run (a single
+    failing telemetry tool returns a 400 that aborts the whole response). When
+    that happens we forward the raw alert flagged needs-human so the gate holds
+    and a person still gets emailed.
+    """
+    source = str(event.get("source") or "alert")
+    summary = json.dumps(event.get("payload"), default=str)[:1500]
+    return (
+        "Root cause: Automated RCA was unavailable for this alert (the analysis "
+        "agent could not complete — e.g. a telemetry tool returned an error), so "
+        "the raw alert is forwarded for human review.\n"
+        "Severity: Unknown\n"
+        f"Evidence: {source} alert payload: {summary}\n"
+        "Proposed fix: A human should inspect the affected host(s) directly. "
+        "Missing telemetry may mean the host is DOWN, not healthy.\n"
+        "Risk: Unknown\n"
+        "Approval: Needs-human"
+    )
+
+
 # --- Public interface (unchanged for function_app.py / bot.py) ---------------
 def analyze_alert(event: dict) -> str | None:
     """Run the coordinator over an alert and return its compiled report, or None.
@@ -560,7 +583,15 @@ def analyze_alert(event: dict) -> str | None:
         except Exception:
             logging.debug("alert_enrich_failed", exc_info=True)
 
-        report, _ = _respond(_COORDINATOR_NAME, content)
+        # The agent grounds RCA in live telemetry, but a single failing MCP
+        # tool returns a 400 that aborts the whole response. A human must still
+        # be notified, so on any agent error we fall back to the raw alert.
+        try:
+            report, _ = _respond(_COORDINATOR_NAME, content)
+        except Exception:
+            logging.exception("agent_rca_failed")
+            report = _fallback_report(event)
+
         if report:
             decision, reason = _enforce_gate(report)
             report = f"{report}\nGate (enforced in code): {decision} — {reason}"
