@@ -1,0 +1,71 @@
+# NOTE: __SUBSCRIPTION_ID__ is a placeholder so no real subscription id is
+# committed. Render it before deploying, e.g. (PowerShell):
+#   (Get-Content infra/azure-mcp-aca.yaml) -replace '__SUBSCRIPTION_ID__', $env:AZURE_SUBSCRIPTION_ID |
+#     az containerapp create -g <rg> -n ca-azure-mcp-prod --yaml /dev/stdin
+location: East US
+identity:
+  type: SystemAssigned
+properties:
+  managedEnvironmentId: /subscriptions/__SUBSCRIPTION_ID__/resourceGroups/rg-devops-commander-prod/providers/Microsoft.App/managedEnvironments/cae-devops-commander-prod
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: http
+      allowInsecure: false
+  template:
+    containers:
+      - name: azure-mcp
+        image: mcr.microsoft.com/azure-sdk/azure-mcp:latest
+        command: []
+        resources:
+          cpu: 0.5
+          memory: 1.0Gi
+        env:
+          - name: ASPNETCORE_ENVIRONMENT
+            value: Production
+          # Must be 0.0.0.0 (not "+"): the server validates ASPNETCORE_URLS via System.Uri in
+          # insecure mode, and "+" is not parsed as a wildcard host, so it gets rejected as an
+          # "explicit external binding". 0.0.0.0 maps to IPAddress.Any and passes the check.
+          - name: ASPNETCORE_URLS
+            value: http://0.0.0.0:8080
+          # Insecure mode (incoming auth disabled) refuses to bind beyond loopback unless this
+          # opt-in is set. ACA needs all-interfaces binding so the Envoy proxy can reach the
+          # container, so this is required here. Endpoint is still scoped to RG-ERP-DEV via MI RBAC.
+          - name: ALLOW_INSECURE_EXTERNAL_BINDING
+            value: "true"
+          - name: AZURE_SUBSCRIPTION_ID
+            value: __SUBSCRIPTION_ID__
+          - name: AZURE_TOKEN_CREDENTIALS
+            value: managedidentitycredential
+          - name: AZURE_MCP_INCLUDE_PRODUCTION_CREDENTIALS
+            value: "true"
+          - name: AZURE_MCP_COLLECT_TELEMETRY
+            value: "false"
+          # MCP server listens on plain HTTP inside the pod (port 8080); the Container Apps
+          # Envoy proxy terminates HTTPS at the ingress boundary. Disable HTTPS redirection so
+          # the internal HTTP startup probe and traffic are not 307-redirected.
+          - name: AZURE_MCP_DANGEROUSLY_DISABLE_HTTPS_REDIRECTION
+            value: "true"
+          - name: AZURE_MCP_DANGEROUSLY_ENABLE_FORWARDED_HEADERS
+            value: "true"
+        args:
+          - "--transport"
+          - "http"
+          - "--dangerously-disable-http-incoming-auth"
+          - "--outgoing-auth-strategy"
+          - "UseHostingEnvironmentIdentity"
+          - "--mode"
+          - "all"
+          - "--namespace"
+          - "compute"
+          - "--namespace"
+          - "monitor"
+          - "--namespace"
+          - "resourcehealth"
+          - "--namespace"
+          - "group"
+    scale:
+      minReplicas: 1
+      maxReplicas: 1

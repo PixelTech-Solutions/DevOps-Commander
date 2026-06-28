@@ -2,16 +2,23 @@
 """Seed the `erp-knowledge` Azure AI Search index (Step 8 RAG knowledge base).
 
 The diagnosis agent grounds its analysis in this index. It holds three kinds of
-records, all drawn from `Resources/INFRA-INVENTORY.md` (the recorded source of
-truth):
+records:
 
-  * infra    -- the 4 ERP environments (Azure/AWS x dev/prod) with public and
+  * infra    -- the ERP environments (Azure/AWS x dev/prod) with public and
                 private IPs, SKUs, URLs, services, plus the DevOps Commander
                 platform itself.
   * history  -- implementation history: provisioning, monitoring, the agent fleet.
   * incident -- past incidents and the gotchas we hit, with their resolutions.
 
 Keyword (SIMPLE) search is used, so no embeddings/vectors are needed.
+
+The actual records (which contain real IPs, hostnames and account names) live in
+an **untracked** JSON file so nothing sensitive is committed:
+
+    tools/knowledge_data.local.json   (gitignored)
+
+Copy `tools/knowledge_data.example.json` to that path and fill in your real
+inventory, or point `KNOWLEDGE_DATA_FILE` at your own file.
 
 Run once, locally, after the Search service exists. Values come from the
 Terraform outputs of DevOps-Commander-Infra:
@@ -35,6 +42,13 @@ INDEX_NAME = os.environ.get("SEARCH_INDEX", "erp-knowledge")
 DOCS_CONTAINER = "knowledge-docs"   # B: uploaded company documents
 LOGS_CONTAINER = "knowledge-logs"   # C: exported previous logs (JSON lines)
 
+# Untracked file holding the real infra/history/incident records. Override with
+# KNOWLEDGE_DATA_FILE; defaults to tools/knowledge_data.local.json next to this
+# script (which is gitignored).
+KNOWLEDGE_DATA_FILE = os.environ.get("KNOWLEDGE_DATA_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "knowledge_data.local.json"
+)
+
 _STR = "Edm.String"
 
 INDEX_DEFINITION = {
@@ -54,280 +68,33 @@ INDEX_DEFINITION = {
     ],
 }
 
-# --- Infrastructure inventory (real IPs from Resources/INFRA-INVENTORY.md) ----
-INFRA = [
-    {
-        "id": "infra-azure-dev",
-        "title": "Azure dev environment (rg-erp-dev)",
-        "cloud": "Azure", "env": "dev", "service": "erp-system",
-        "host": "app ***REMOVED*** (private 10.0.1.4); db ***REMOVED*** (private 10.0.2.4)",
-        "content": (
-            "Azure dev ERP in resource group rg-erp-dev, region eastus. App VM vm-erp-dev-app "
-            "(Standard_B1s) public ***REMOVED*** / private 10.0.1.4 runs Spring Boot erp-backend "
-            "on :8080 behind nginx :80. DB VM vm-erp-dev-db (Standard_B1s) public ***REMOVED*** / "
-            "private 10.0.2.4 runs MySQL 8 (database erpdb) on :3306, reachable only from the VNet. "
-            "SSH user azureuser. URL http://***REMOVED***/ ; health http://***REMOVED***/actuator/health. "
-            "Monitored by Grafana Cloud (host erp-azure-app-server-dev / erp-azure-db-server-dev)."
-        ),
-    },
-    {
-        "id": "infra-azure-prod",
-        "title": "Azure prod environment (rg-erp-prod)",
-        "cloud": "Azure", "env": "prod", "service": "erp-system",
-        "host": "app ***REMOVED*** (private 10.0.1.4); db ***REMOVED*** (private 10.0.2.4)",
-        "content": (
-            "Azure prod ERP in resource group rg-erp-prod, region eastus. App VM vm-erp-prod-app "
-            "(Standard_B2s) public ***REMOVED*** / private 10.0.1.4 runs Spring Boot erp-backend on "
-            ":8080 behind nginx :80. DB VM vm-erp-prod-db (Standard_B2s) public ***REMOVED*** / private "
-            "10.0.2.4 runs MySQL 8 (database erpdb) on :3306, reachable only from the VNet. SSH user "
-            "azureuser. URL http://***REMOVED***/ ; health http://***REMOVED***/actuator/health. Active "
-            "Spring profile prod (ddl-auto validate). Monitored by Datadog (host erp-azure-app-server-prod / "
-            "erp-azure-db-server-prod)."
-        ),
-    },
-    {
-        "id": "infra-aws-dev",
-        "title": "AWS dev environment (us-east-1)",
-        "cloud": "AWS", "env": "dev", "service": "erp-system",
-        "host": "app ***REMOVED*** (private 172.31.2.244); db ***REMOVED*** (private 172.31.1.227)",
-        "content": (
-            "AWS dev ERP in the default VPC, region us-east-1. App EC2 (t3.micro) public ***REMOVED*** / "
-            "private 172.31.2.244 runs Spring Boot erp-backend on :8080 behind nginx :80. DB EC2 (t3.micro) "
-            "public ***REMOVED*** / private 172.31.1.227 runs MySQL 8 (database erpdb) on :3306, reachable "
-            "only from the VPC. SSH user ubuntu. URL http://***REMOVED***/ ; health "
-            "http://***REMOVED***/actuator/health. Monitored by Grafana Cloud (host erp-aws-app-server-dev / "
-            "erp-aws-db-server-dev)."
-        ),
-    },
-    {
-        "id": "infra-aws-prod",
-        "title": "AWS prod environment (us-east-1)",
-        "cloud": "AWS", "env": "prod", "service": "erp-system",
-        "host": "app ***REMOVED*** (private 172.31.12.245); db ***REMOVED*** (private 172.31.8.39)",
-        "content": (
-            "AWS prod ERP in the default VPC, region us-east-1. App EC2 (t3.micro) public ***REMOVED*** / private "
-            "172.31.12.245 runs Spring Boot erp-backend on :8080 behind nginx :80. DB EC2 (t3.micro) public "
-            "***REMOVED*** / private 172.31.8.39 runs MySQL 8 (database erpdb) on :3306, reachable only from "
-            "the VPC. SSH user ubuntu. URL http://***REMOVED***/ ; health http://***REMOVED***/actuator/health. "
-            "Monitored by Datadog (host erp-aws-app-server-prod / erp-aws-db-server-prod)."
-        ),
-    },
-    {
-        "id": "infra-platform-stack",
-        "title": "ERP application & data stack (all environments)",
-        "cloud": "Azure+AWS", "env": "all", "service": "erp-system",
-        "host": "app :80 nginx, :8080 backend; db :3306 MySQL (private only)",
-        "content": (
-            "Backend: Spring Boot 3.2.5 on Java 17, packaged as erp-system-1.0.0.jar, runs as systemd service "
-            "erp-backend under user erp. Frontend: React 18 + Vite, served by nginx 1.18 from /var/www/erp; "
-            "nginx proxies /api/ and /actuator/ to 127.0.0.1:8080. Database: MySQL 8, database name erpdb "
-            "everywhere, app user erp_app@% with ALL on erpdb.*, tables customers/products/orders/order_items, "
-            "bind-address 0.0.0.0:3306 reachable only from the private CIDR. Ports: 22 SSH, 80 nginx, 8080 "
-            "backend (debug), 3306 MySQL (private only), 443 reserved (no TLS yet)."
-        ),
-    },
-    {
-        "id": "infra-devops-commander",
-        "title": "DevOps Commander platform (agent fleet + alert receiver)",
-        "cloud": "Azure", "env": "prod", "service": "devops-commander",
-        "host": "func-devops-commander-prod-4bsnhc.azurewebsites.net",
-        "content": (
-            "Azure-native control plane for the agents. Resource group rg-devops-commander-prod, region eastus. "
-            "Function App func-devops-commander-prod-4bsnhc (Python 3.11, Linux Y1 Consumption) receives Datadog/"
-            "Grafana webhooks at POST /api/alert (header X-Alert-Token) and exposes GET /api/health. User-assigned "
-            "identity id-devops-commander-prod authenticates keyless to GPT-4o. Foundry (AIServices) resource "
-            "devops-commanderv1 in resource group devops-commander hosts project devops-commander with model "
-            "deployment gpt-4o. App Insights appi-devops-commander-prod. The agent fleet (coordinator + diagnosis + "
-            "remediation + risk) runs server-side on the Foundry project."
-        ),
-    },
-]
 
-# --- Implementation history --------------------------------------------------
-HISTORY = [
-    {
-        "id": "history-provisioning",
-        "title": "Infrastructure provisioning history",
-        "cloud": "Azure+AWS", "env": "all", "service": "erp-system",
-        "host": "",
-        "content": (
-            "All 4 ERP environments were provisioned with Terraform via the reusable workflow "
-            "PixelTech-Solutions/Terraform terraform.yml (Azure via OIDC, AWS via access keys). Azure dev and prod "
-            "and AWS dev and prod all applied OK (AWS needed a security-group name fix because names cannot start "
-            "with sg-). Terraform state lives in azurerm storage account ***REMOVED***, container tfstate, RG "
-            "rg-terraform-state, key pattern erp-system/<cloud>/<env>/terraform.tfstate. App config is applied by "
-            "Ansible (ERP_System deploy-ansible.yml: resolve -> build -> configure-database -> deploy-application -> "
-            "smoke-test)."
-        ),
-    },
-    {
-        "id": "history-monitoring",
-        "title": "Monitoring and alerting setup",
-        "cloud": "Azure+AWS", "env": "all", "service": "monitoring",
-        "host": "",
-        "content": (
-            "Datadog (site us5.datadoghq.com, agent v7) covers production; Grafana Cloud (region prod-ap-southeast-1, "
-            "grafana-agent + node-exporter on :9100) covers development. Both push from the VMs, no inbound ports. "
-            "Hosts follow erp-<cloud>-<role>-<env>; metrics carry labels env, cloud, service=erp-system, role. Alert "
-            "rules: prod-backend-down and prod-5xx-spike (Datadog), dev-backend-down and dev-error-log-spike "
-            "(Grafana). Alerts originally went to webhook.site and now POST to the DevOps Commander /api/alert "
-            "endpoint, which hands off to the agent fleet."
-        ),
-    },
-    {
-        "id": "history-agents",
-        "title": "DevOps Commander agent fleet history",
-        "cloud": "Azure", "env": "prod", "service": "devops-commander",
-        "host": "",
-        "content": (
-            "Step 5 added the first Foundry agent plus the alert webhook. Step 6 introduced the Connected Agents "
-            "pattern: a coordinator (devops-commander-coordinator) delegates to specialists devops-commander-rca "
-            "(diagnosis) and devops-commander-remediation. Step 7 added devops-commander-risk, an independent "
-            "reviewer, plus a deterministic code-side human-in-the-loop gate that holds any destructive, "
-            "high/critical, or needs-human action for a human. Auth is keyless via the Function App managed identity "
-            "(Foundry User role); no API keys are stored. Step 8 grounds the diagnosis agent in this Azure AI Search "
-            "knowledge base."
-        ),
-    },
-]
+def _load_inventory() -> dict:
+    """Load the infra/history/incident records from the untracked local JSON.
 
-# --- Past incidents and captured gotchas -------------------------------------
-INCIDENTS = [
-    {
-        "id": "inc-ssh-banner",
-        "title": "SSH 'connection timed out during banner exchange'",
-        "cloud": "Azure", "env": "prod", "service": "app-server", "severity": "high",
-        "content": (
-            "Symptom: SSH hangs with 'Connection timed out during banner exchange' even though TCP/22 connects. "
-            "Root cause: sshd is hung or the VM is out of memory or disk. Resolution: use the Azure Serial Console "
-            "(portal -> VM -> Help -> Serial console) to log in out-of-band, then free disk/memory or restart sshd."
-        ),
-    },
-    {
-        "id": "inc-mysql-bind-restart",
-        "title": "MySQL bind-address change needs a restart",
-        "cloud": "Azure+AWS", "env": "all", "service": "mysql", "severity": "high",
-        "content": (
-            "Symptom: app cannot reach MySQL after a config change. Root cause: changing MySQL bind-address requires "
-            "a service restart, and Ansible skips handlers when a play fails partway. Resolution: set "
-            "force_handlers: true and add an explicit 'ss -tlnH sport = :3306' check so db.yml self-heals and the "
-            "restart actually happens."
-        ),
-    },
-    {
-        "id": "inc-prod-ddl-validate",
-        "title": "Prod backend fails to start (ddl-auto validate)",
-        "cloud": "Azure+AWS", "env": "prod", "service": "erp-backend", "severity": "high",
-        "content": (
-            "Symptom: prod backend won't start or errors on schema validation. Root cause: the prod profile uses "
-            "ddl-auto: validate, so the schema must already exist; the dev/H2 happy path hides this. Resolution: "
-            "import db/schema.sql (via ansible db.yml) before starting erp-backend in prod."
-        ),
-    },
-    {
-        "id": "inc-hibernate-enum",
-        "title": "Hibernate enum mapped to native MySQL ENUM",
-        "cloud": "Azure+AWS", "env": "all", "service": "erp-backend", "severity": "medium",
-        "content": (
-            "Symptom: schema validation / insert errors on the orders table OrderStatus column. Root cause: "
-            "Hibernate maps the OrderStatus enum to a native MySQL ENUM, but the schema uses VARCHAR(20). "
-            "Resolution: annotate the field with @JdbcTypeCode(SqlTypes.VARCHAR) and @Column(length=20)."
-        ),
-    },
-    {
-        "id": "inc-aws-sg-name",
-        "title": "AWS security group name cannot start with sg-",
-        "cloud": "AWS", "env": "all", "service": "network", "severity": "low",
-        "content": (
-            "Symptom: Terraform apply fails creating the security group. Root cause: AWS reserves the sg- prefix for "
-            "security group IDs, so a name cannot start with sg-. Resolution: name groups <prefix>-app-sg and "
-            "<prefix>-db-sg."
-        ),
-    },
-    {
-        "id": "inc-func-404-deps",
-        "title": "Function App returns 404 (no functions discovered)",
-        "cloud": "Azure", "env": "prod", "service": "devops-commander", "severity": "high",
-        "content": (
-            "Symptom: every endpoint on the Function App returns 404 and no functions are discovered. Root cause: "
-            "Linux Consumption (Y1) with RBAC/run-from-package deploys bypass Kudu/Oryx, so requirements.txt is not "
-            "installed remotely and the Python worker can't import azure-functions. Resolution: in the deploy "
-            "workflow run 'pip install -r requirements.txt --target=.python_packages/lib/site-packages' before "
-            "publishing the zip."
-        ),
-    },
-    {
-        "id": "inc-grafana-loki-url",
-        "title": "Grafana Cloud Loki push URL missing path",
-        "cloud": "Azure+AWS", "env": "dev", "service": "monitoring", "severity": "low",
-        "content": (
-            "Symptom: logs never arrive in Grafana Cloud Loki. Root cause: the Cloud UI only shows the base URL; the "
-            "Loki push URL must end with /loki/api/v1/push. Note Grafana Cloud has two different numeric basic-auth "
-            "users, one for Prometheus (Mimir) and one for Loki. Resolution: append the path and use the correct "
-            "per-service user."
-        ),
-    },
-    {
-        "id": "inc-mysql-conn-pool",
-        "title": "MySQL prod unreachable - connection pool exhausted",
-        "cloud": "Azure", "env": "prod", "service": "mysql", "severity": "critical",
-        "content": (
-            "Symptom: app returns 'too many connections', health checks fail, database connectivity alerts fire. "
-            "Root cause: the connection pool was exhausted after a traffic spike and idle connections were never "
-            "recycled. Resolution: raise max_connections, set a sane pool TTL in the app, and restart MySQL to clear "
-            "stuck connections (human-approved)."
-        ),
-    },
-    {
-        "id": "inc-nginx-502-oom",
-        "title": "nginx 502 Bad Gateway - backend OOM",
-        "cloud": "AWS", "env": "prod", "service": "nginx", "severity": "high",
-        "content": (
-            "Symptom: intermittent 502s; nginx logs show 'upstream prematurely closed connection'. Root cause: the "
-            "Spring Boot backend was OOM-killed and stopped accepting requests. Resolution: raise the JVM/container "
-            "memory, fix the leak, and restart erp-backend (human-approved)."
-        ),
-    },
-    {
-        "id": "inc-disk-full-logs",
-        "title": "Disk full on the application server",
-        "cloud": "Azure", "env": "prod", "service": "app-server", "severity": "medium",
-        "content": (
-            "Symptom: writes fail with 'No space left on device'; background jobs stop. Root cause: nginx and "
-            "application logs were never rotated and filled the data disk. Resolution: enable logrotate with "
-            "compression and retention and ship verbose logs off-box."
-        ),
-    },
-    {
-        "id": "inc-latency-missing-index",
-        "title": "High API latency after a release",
-        "cloud": "AWS", "env": "prod", "service": "erp-backend", "severity": "high",
-        "content": (
-            "Symptom: p95 latency jumped from ~120ms to ~3s right after a deploy; MySQL shows full table scans. Root "
-            "cause: a schema migration dropped a composite index a hot query depended on. Resolution: recreate the "
-            "index and add a CI check for dropped indexes."
-        ),
-    },
-    {
-        "id": "inc-tls-cert-expired",
-        "title": "TLS certificate expired at the edge",
-        "cloud": "Azure", "env": "prod", "service": "edge-tls", "severity": "high",
-        "content": (
-            "Symptom: browsers show NET::ERR_CERT_DATE_INVALID and API clients reject the connection. Root cause: "
-            "the automated certificate renewal job failed silently. Resolution: renew the certificate, fix the "
-            "renewal job, and add an expiry alert 30 days out."
-        ),
-    },
-]
+    The real inventory (IPs, hostnames, account names) is never committed. Copy
+    tools/knowledge_data.example.json to tools/knowledge_data.local.json and
+    fill it in, or set KNOWLEDGE_DATA_FILE.
+    """
+    if not os.path.exists(KNOWLEDGE_DATA_FILE):
+        sys.exit(
+            f"Knowledge data file not found: {KNOWLEDGE_DATA_FILE}\n"
+            "Copy tools/knowledge_data.example.json to "
+            "tools/knowledge_data.local.json and fill in your real inventory "
+            "(or set KNOWLEDGE_DATA_FILE)."
+        )
+    with open(KNOWLEDGE_DATA_FILE, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def _docs() -> list[dict]:
+    data = _load_inventory()
     out: list[dict] = []
-    for d in INFRA:
+    for d in data.get("infra", []):
         out.append({"doc_type": "infra", "severity": "", **d})
-    for d in HISTORY:
+    for d in data.get("history", []):
         out.append({"doc_type": "history", "severity": "", **d})
-    for d in INCIDENTS:
+    for d in data.get("incidents", []):
         out.append({"doc_type": "incident", "host": "", **d})
     return out
 

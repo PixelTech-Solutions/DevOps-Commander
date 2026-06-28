@@ -52,6 +52,32 @@ _CHAT_NAME = "devops-commander-chat"
 # Cap on local function-tool round-trips per turn (guards against a tool loop).
 _MAX_TOOL_ITERS = 5
 
+# Azure subscription/tenant the agents should target, read from the environment
+# (never hardcoded in source). When set, the agents are told the exact values so
+# the model never invents a placeholder tenant/subscription; when unset they are
+# told to use whatever the tools are already configured for.
+_AZ_SUB = os.environ.get("AZURE_SUBSCRIPTION_ID", "").strip()
+_AZ_TEN = os.environ.get("AZURE_TENANT_ID", "").strip()
+if _AZ_SUB and _AZ_TEN:
+    _AZ_TARGET = f"operate on subscription {_AZ_SUB} in tenant {_AZ_TEN}. "
+elif _AZ_SUB:
+    _AZ_TARGET = f"operate on subscription {_AZ_SUB}. "
+else:
+    _AZ_TARGET = (
+        "operate only on the subscription and tenant the tools are already "
+        "configured for. "
+    )
+_AZURE_TOOL_GUIDANCE = (
+    "AZURE CONTEXT: when you call any Azure tool, " + _AZ_TARGET +
+    "Only pass a tenant or subscription argument when the tool truly requires "
+    "it, and then use exactly those real values — never invent or pass "
+    "placeholders such as 'your-tenant-id' or 'your-subscription-id'.\n"
+    "To inspect VMs: first list them (e.g. group_resource_list or "
+    "compute_vm_get without instance-view), then for power state call the VM "
+    "with a specific vm-name — the instance-view/power-state option only works "
+    "for one named VM, never for a whole resource group at once.\n"
+)
+
 # --- Instructions ------------------------------------------------------------
 _COORDINATOR_INSTRUCTIONS = (
     "You are DevOps Commander, the incident coordinator for a multi-cloud ERP "
@@ -66,16 +92,7 @@ _COORDINATOR_INSTRUCTIONS = (
     "- AWS (manage): EC2/SSM/CloudWatch inventory plus management actions "
     "(start/stop/reboot instances, run commands, read logs/metrics) for the "
     "AWS-hosted ERP servers.\n"
-    "AZURE CONTEXT: when you call any Azure tool, operate on subscription "
-    "***REMOVED*** in tenant "
-    "***REMOVED***. Only pass a tenant or subscription "
-    "argument when the tool truly requires it, and then use exactly those real "
-    "values — never invent or pass placeholders such as 'your-tenant-id' or "
-    "'your-subscription-id'.\n"
-    "To inspect VMs: first list them (e.g. group_resource_list or compute_vm_get "
-    "without instance-view), then for power state call the VM with a specific "
-    "vm-name — the instance-view/power-state option only works for one named VM, "
-    "never for a whole resource group at once.\n"
+    + _AZURE_TOOL_GUIDANCE +
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: past incidents, runbooks, and the infrastructure inventory "
     "(environments, services, hosts and IPs).\n"
@@ -130,16 +147,7 @@ _CHAT_INSTRUCTIONS = (
     "- AWS (manage): EC2/SSM/CloudWatch inventory and management (start/stop/"
     "reboot instances, run commands, read logs/metrics) for the AWS-hosted ERP "
     "servers.\n"
-    "AZURE CONTEXT: when you call any Azure tool, operate on subscription "
-    "***REMOVED*** in tenant "
-    "***REMOVED***. Only pass a tenant or subscription "
-    "argument when the tool truly requires it, and then use exactly those real "
-    "values — never invent or pass placeholders such as 'your-tenant-id' or "
-    "'your-subscription-id'.\n"
-    "To inspect VMs: first list them (e.g. group_resource_list or compute_vm_get "
-    "without instance-view), then for power state call the VM with a specific "
-    "vm-name — the instance-view/power-state option only works for one named VM, "
-    "never for a whole resource group at once.\n"
+    + _AZURE_TOOL_GUIDANCE +
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
     "host and IP), past incidents, and implementation history.\n"

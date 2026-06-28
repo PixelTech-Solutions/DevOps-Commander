@@ -27,3 +27,10 @@ obj/
 .DS_Store
 
 knowledge-logs.jsonl
+
+# Local-only data / secrets (never commit real inventory, IPs, IDs)
+*.local.json
+*.local.yaml
+tools/knowledge_data.local.json
+.env
+.env.*

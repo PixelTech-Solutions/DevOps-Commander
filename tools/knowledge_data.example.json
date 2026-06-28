@@ -1,0 +1,36 @@
+{
+  "_comment": "Template for tools/knowledge_data.local.json (which is gitignored). Replace the placeholder IPs, hostnames, account names, sites and IDs with your real values. The real file is never committed.",
+  "infra": [
+    {
+      "id": "infra-azure-dev",
+      "title": "Azure dev environment (<resource-group>)",
+      "cloud": "Azure",
+      "env": "dev",
+      "service": "erp-system",
+      "host": "app <APP_PUBLIC_IP> (private <APP_PRIVATE_IP>); db <DB_PUBLIC_IP> (private <DB_PRIVATE_IP>)",
+      "content": "Azure dev ERP in resource group <resource-group>, region <region>. App VM <app-vm-name> (<sku>) public <APP_PUBLIC_IP> / private <APP_PRIVATE_IP> runs Spring Boot erp-backend on :8080 behind nginx :80. DB VM <db-vm-name> (<sku>) public <DB_PUBLIC_IP> / private <DB_PRIVATE_IP> runs MySQL 8 (database <db-name>) on :3306, reachable only from the VNet. SSH user <ssh-user>. URL http://<APP_PUBLIC_IP>/ ; health http://<APP_PUBLIC_IP>/actuator/health. Monitored by <monitoring-host>."
+    }
+  ],
+  "history": [
+    {
+      "id": "history-provisioning",
+      "title": "Infrastructure provisioning history",
+      "cloud": "Azure+AWS",
+      "env": "all",
+      "service": "erp-system",
+      "host": "",
+      "content": "All ERP environments were provisioned with Terraform. Terraform state lives in an azurerm storage account <state-storage-account>, container <state-container>, key pattern erp-system/<cloud>/<env>/terraform.tfstate. App config is applied by Ansible."
+    }
+  ],
+  "incidents": [
+    {
+      "id": "inc-example",
+      "title": "Short symptom title",
+      "cloud": "Azure",
+      "env": "prod",
+      "service": "app-server",
+      "severity": "high",
+      "content": "Symptom: ... Root cause: ... Resolution: ..."
+    }
+  ]
+}
