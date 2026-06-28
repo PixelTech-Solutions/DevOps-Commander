@@ -248,9 +248,10 @@ def _mcp_tools() -> list:
     # Azure MCP (manage): Azure control-plane operations for the Azure-hosted
     # ERP — resource inventory, Azure Monitor metrics & logs, resource health,
     # AND management actions (start/stop/restart VMs, run commands, scale,
-    # config). Remote endpoint + a Custom-keys connection whose identity carries
-    # the write RBAC the server is allowed to use. The connection is optional:
-    # set AZURE_MCP_CONNECTION="" for a no-auth host.
+    # config). Remote endpoint + an optional Custom-keys connection whose
+    # identity carries the write RBAC the server is allowed to use. The
+    # connection is opt-in: leave AZURE_MCP_CONNECTION unset (or empty) for a
+    # no-auth host; set it to a connection name to attach credentials.
     az_url = os.environ.get("AZURE_MCP_URL")
     if az_url:
         az_kwargs = {
@@ -264,7 +265,7 @@ def _mcp_tools() -> list:
             ),
             "require_approval": "never",
         }
-        az_conn = os.environ.get("AZURE_MCP_CONNECTION", "azure-mcp")
+        az_conn = os.environ.get("AZURE_MCP_CONNECTION", "")
         if az_conn:
             az_kwargs["project_connection_id"] = az_conn
         tools.append(MCPTool(**az_kwargs))
@@ -273,7 +274,7 @@ def _mcp_tools() -> list:
     # audited) covering the AWS half of the ERP (e.g. erp-aws-app-server-dev)
     # that Azure tools can't see — EC2/SSM/CloudWatch inventory AND management
     # (start/stop/reboot instances, run commands, read logs/metrics). Same
-    # remote pattern; set AWS_MCP_CONNECTION="" for a no-auth endpoint.
+    # remote pattern; leave AWS_MCP_CONNECTION unset for a no-auth endpoint.
     aws_url = os.environ.get("AWS_MCP_URL")
     if aws_url:
         aws_kwargs = {
@@ -286,7 +287,7 @@ def _mcp_tools() -> list:
             ),
             "require_approval": "never",
         }
-        aws_conn = os.environ.get("AWS_MCP_CONNECTION", "aws-mcp")
+        aws_conn = os.environ.get("AWS_MCP_CONNECTION", "")
         if aws_conn:
             aws_kwargs["project_connection_id"] = aws_conn
         tools.append(MCPTool(**aws_kwargs))
