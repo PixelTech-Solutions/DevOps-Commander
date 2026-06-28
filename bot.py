@@ -11,6 +11,7 @@ rotate. The modern ``CloudAdapter`` stack is used because the legacy
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -25,7 +26,61 @@ from botbuilder.integration.aiohttp import (
     CloudAdapter,
     ConfigurationBotFrameworkAuthentication,
 )
-from botbuilder.schema import Activity, ChannelAccount
+from botbuilder.schema import Activity, ChannelAccount, ConversationReference
+
+
+# --- Proactive-message conversation references -------------------------------
+# To message a human in Teams *before* they say anything (i.e. when an alert
+# fires), we must have captured a ConversationReference from an earlier turn.
+# Teams references are durable, so we persist them in Table Storage (reusing the
+# Functions storage account) and replay them from the notifier. Web Chat /
+# Direct Line references are ephemeral, so only Teams turns are stored.
+_REF_TABLE = "botconversations"
+
+
+def _ref_table():
+    conn = os.environ.get("AzureWebJobsStorage", "")
+    if not conn:
+        return None
+    from azure.data.tables import TableServiceClient
+
+    service = TableServiceClient.from_connection_string(conn)
+    return service.create_table_if_not_exists(_REF_TABLE)
+
+
+def _save_reference(reference: ConversationReference) -> None:
+    try:
+        table = _ref_table()
+        if table is None:
+            return
+        ref = reference.serialize()
+        conv_id = (ref.get("conversation") or {}).get("id") or "unknown"
+        table.upsert_entity(
+            {
+                "PartitionKey": "teams",
+                "RowKey": conv_id.replace("/", "_")[:1024],
+                "ref": json.dumps(ref),
+            }
+        )
+    except Exception:  # pragma: no cover - best effort
+        logging.exception("bot_ref_save_failed")
+
+
+def _load_references() -> list[ConversationReference]:
+    refs: list[ConversationReference] = []
+    try:
+        table = _ref_table()
+        if table is None:
+            return refs
+        for entity in table.list_entities():
+            try:
+                refs.append(ConversationReference().deserialize(json.loads(entity["ref"])))
+            except Exception:
+                continue
+    except Exception:  # pragma: no cover - best effort
+        logging.exception("bot_ref_load_failed")
+    return refs
+
 
 
 # --- Destructive-intent detection (deterministic; the LLM never touches the
@@ -148,6 +203,17 @@ class CommanderBot(ActivityHandler):
 
     def __init__(self) -> None:
         self._threads: dict[str, str] = {}
+
+    async def on_turn(self, turn_context: TurnContext):
+        # Capture durable Teams conversation references so the alert path can
+        # message this human proactively later. Other channels are ephemeral.
+        try:
+            activity = turn_context.activity
+            if activity and activity.channel_id == "msteams":
+                _save_reference(TurnContext.get_conversation_reference(activity))
+        except Exception:  # pragma: no cover - best effort
+            logging.exception("bot_ref_capture_failed")
+        await super().on_turn(turn_context)
 
     async def on_message_activity(self, turn_context: TurnContext):
         activity = turn_context.activity
@@ -306,3 +372,33 @@ async def process(body: dict, auth_header: str):
     adapter = _get_adapter()
     bot = _get_bot()
     return await adapter.process_activity(auth_header, activity, bot.on_turn)
+
+
+async def notify_teams_proactive(text: str, approval: dict | None = None) -> None:
+    """Proactively message every stored Teams conversation.
+
+    No-op when no references are stored (e.g. Teams not yet licensed / nobody
+    has messaged the bot), so the email path works on its own. For an approval,
+    the same Adaptive Card the chat flow uses is attached, sharing one token.
+    """
+    references = _load_references()
+    if not references:
+        logging.info("notify_teams_no_refs")
+        return
+
+    adapter = _get_adapter()
+    app_id = _BotConfig.APP_ID
+
+    async def _logic(turn_context: TurnContext):
+        await turn_context.send_activity(MessageFactory.text(text))
+        if approval and approval.get("token"):
+            await turn_context.send_activity(
+                MessageFactory.attachment(_approval_card(approval))
+            )
+
+    for reference in references:
+        try:
+            await adapter.continue_conversation(reference, _logic, bot_app_id=app_id)
+        except Exception:  # pragma: no cover - best effort
+            logging.exception("notify_teams_send_failed")
+

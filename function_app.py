@@ -300,6 +300,62 @@ def approve(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+def _approval_page(title: str, message: str, ok: bool) -> func.HttpResponse:
+    color = "#107c10" if ok else "#a4262c"
+    safe = message.replace("<", "&lt;").replace(">", "&gt;")
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>DevOps Commander</title></head>"
+        "<body style='font-family:Segoe UI,Arial,sans-serif;background:#faf9f8;"
+        "display:flex;justify-content:center;padding:48px 16px;'>"
+        "<div style='max-width:520px;background:#fff;border-radius:10px;padding:32px;"
+        "box-shadow:0 2px 8px rgba(0,0,0,.08);'>"
+        f"<h2 style='color:{color};margin-top:0;'>{title}</h2>"
+        f"<p style='font-size:15px;color:#333;'>{safe}</p>"
+        "<p style='color:#999;font-size:12px;'>DevOps Commander</p>"
+        "</div></body></html>"
+    )
+    return func.HttpResponse(html, status_code=200, mimetype="text/html")
+
+
+@app.route(route="approval", methods=["GET"])
+def approval(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /api/approval?token=...&decision=approve|reject — email/Teams link.
+
+    The signed, single-use token is itself the bearer of authority (HMAC,
+    expiring, nonce-spent on use), so a click from an email is sufficient — no
+    shared-secret header is required. Approve runs the action via the same
+    executor gate as ``/api/approve``; reject simply lets the token expire.
+    Returns a friendly HTML page since a human's browser lands here.
+    """
+    token = (req.params.get("token") or "").strip()
+    decision = (req.params.get("decision") or "approve").strip().lower()
+    if not token:
+        return _approval_page("Invalid link", "This approval link is missing its token.", False)
+
+    if decision == "reject":
+        return _approval_page(
+            "Rejected",
+            "The action was not run. The approval token will expire unused.",
+            True,
+        )
+
+    import executor
+
+    try:
+        result = executor.approve_and_run(token)
+    except executor.ActionError as exc:
+        logging.warning("approval_link_refused %s", json.dumps({"reason": str(exc)}))
+        return _approval_page("Could not approve", str(exc), False)
+    except Exception:
+        logging.exception("approval_link_failed")
+        return _approval_page("Action failed", "The action could not be executed.", False)
+
+    summary = result.get("summary") or result.get("output") or "The action was executed."
+    return _approval_page("Approved", str(summary), True)
+
+
 @app.route(route="messages", methods=["POST"])
 async def messages(req: func.HttpRequest) -> func.HttpResponse:
     """POST /api/messages — Bot Framework endpoint for the Web Chat channel.

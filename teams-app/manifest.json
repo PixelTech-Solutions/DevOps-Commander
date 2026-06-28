@@ -1,0 +1,76 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.21/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.21",
+  "version": "1.0.0",
+  "id": "1e698a15-d8d1-4b19-8399-5a8886acff1d",
+  "developer": {
+    "name": "PixelTech Solutions",
+    "websiteUrl": "https://func-devops-commander-prod-4bsnhc.azurewebsites.net/api/webchat",
+    "privacyUrl": "https://func-devops-commander-prod-4bsnhc.azurewebsites.net/api/webchat",
+    "termsOfUseUrl": "https://func-devops-commander-prod-4bsnhc.azurewebsites.net/api/webchat"
+  },
+  "name": {
+    "short": "DevOps Commander",
+    "full": "DevOps Commander - ERP Ops Assistant"
+  },
+  "description": {
+    "short": "AI ops assistant for the PixelTech ERP: diagnostics, RAG answers, approval-gated actions.",
+    "full": "DevOps Commander is a multi-agent assistant for the PixelTech ERP. Ask it to investigate incidents, query the knowledge base, check service status, and run approval-gated operational actions (restart a service, delete a record) with an in-chat Approve/Reject card. Destructive actions always require explicit human approval."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0F6CBD",
+  "bots": [
+    {
+      "botId": "8faf0956-7033-425b-a8a7-8746b1308713",
+      "scopes": [
+        "personal",
+        "team",
+        "groupChat",
+        "copilot"
+      ],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal",
+            "copilot"
+          ],
+          "commands": [
+            {
+              "title": "service status",
+              "description": "Check the status of the ERP backend service"
+            },
+            {
+              "title": "list customers",
+              "description": "List customers from the dev database"
+            },
+            {
+              "title": "recent app logs",
+              "description": "Show the most recent application logs"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "copilotAgents": {
+    "customEngineAgents": [
+      {
+        "type": "bot",
+        "id": "8faf0956-7033-425b-a8a7-8746b1308713"
+      }
+    ]
+  },
+  "permissions": [
+    "identity",
+    "messageTeamMembers"
+  ],
+  "validDomains": [
+    "func-devops-commander-prod-4bsnhc.azurewebsites.net",
+    "token.botframework.com"
+  ]
+}

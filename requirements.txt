@@ -23,3 +23,6 @@ botbuilder-integration-aiohttp==4.16.2
 # newer wheel's Rust binding requires GLIBC_2.33, which the Functions Linux
 # Consumption host does not have (ImportError at import time).
 cryptography==42.0.8
+# Alert notifications: Azure Communication Services email (azure-native, no SMTP
+# server / third-party key). Pure-python, ships cleanly to Linux Consumption.
+azure-communication-email==1.0.0

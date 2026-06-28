@@ -553,6 +553,14 @@ def analyze_alert(event: dict) -> str | None:
         if report:
             decision, reason = _enforce_gate(report)
             report = f"{report}\nGate (enforced in code): {decision} — {reason}"
+            # Tell a human out of band (email + best-effort Teams), carrying
+            # Approve/Reject controls when the gate holds. Best-effort only.
+            try:
+                import notifier
+
+                notifier.notify_alert(report, decision, reason, str(event.get("source") or "alert"))
+            except Exception:
+                logging.exception("alert_notify_failed")
         return report or None
     except Exception:
         logging.exception("agent_rca_failed")
