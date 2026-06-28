@@ -180,9 +180,9 @@ _CHAT_INSTRUCTIONS = (
     "Approve/Reject card; they do NOT act until a human clicks Approve). These "
     "tools require the REAL EC2 instance id (format i-0123456789abcdef0). When "
     "the user refers to an instance by role or name (e.g. 'the dev db'), FIRST "
-    "resolve its real instance id with the AWS read-only tools (describe the "
-    "instances and match by Name tag) \u2014 never pass a monitoring label, "
-    "hostname, or knowledge-base nickname as the instance id. When the user asks "
+    "call list_dev_ec2 to get the real instance id and current state \u2014 never "
+    "pass a monitoring label, hostname, or knowledge-base nickname as the "
+    "instance id, and do not guess Name tags. When the user asks "
     "to stop or reboot a dev instance, CALL the tool with that id, then tell the "
     "user an approval card is shown and they must click Approve. NEVER say the "
     "instance was stopped or rebooted until it actually is.\n"
@@ -467,6 +467,22 @@ def reboot_ec2(instance_id: str) -> str:
     return _cloud_request("reboot_ec2", "aws", {"instance_id": instance_id})
 
 
+def list_dev_ec2() -> str:
+    """Deterministic lookup of the managed dev EC2 instances (name, id, state)."""
+    import executor
+
+    try:
+        rows = executor.describe_dev_instances()
+    except Exception:
+        logging.exception("list_dev_ec2_failed")
+        return "Could not list dev EC2 instances."
+    if not rows:
+        return "No development EC2 instances are configured."
+    return "\n".join(
+        f"{r['name']}: {r['instance_id']} (state: {r['state']})" for r in rows
+    )
+
+
 _TOOL_DISPATCH = {
     "count_dev_customers": count_dev_customers,
     "list_dev_customers": list_dev_customers,
@@ -476,6 +492,7 @@ _TOOL_DISPATCH = {
     "dev_disk_usage": dev_disk_usage,
     "dev_vm_metric": dev_vm_metric,
     "query_dev_telemetry": query_dev_telemetry,
+    "list_dev_ec2": list_dev_ec2,
     "stop_ec2": stop_ec2,
     "start_ec2": start_ec2,
     "reboot_ec2": reboot_ec2,
@@ -583,6 +600,11 @@ def _cloud_function_tools() -> list:
         }
     }
     return [
+        FunctionTool(
+            name="list_dev_ec2",
+            description="List the managed DEVELOPMENT AWS EC2 instances with their real instance id and live power state. Use this to find an instance id before any power action.",
+            parameters=_obj(),
+        ),
         FunctionTool(
             name="stop_ec2",
             description="Stop a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT stop the instance by itself.",

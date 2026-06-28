@@ -201,6 +201,29 @@ def _reboot_ec2(params: dict) -> str:
     return f"{AWS_DEV_INSTANCES[iid]} ({iid}): reboot requested"
 
 
+def describe_dev_instances() -> list[dict]:
+    """Deterministic, read-only listing of the managed dev EC2 instances.
+
+    Returns each known dev instance (name + id) with its live power state, so a
+    caller never has to guess a Name tag to find an instance id. Uses the same
+    least-privilege exec key (which has ec2:DescribeInstances). Production
+    instances are intentionally not in AWS_DEV_INSTANCES, so they never appear.
+    """
+    ids = list(AWS_DEV_INSTANCES.keys())
+    states: dict[str, str] = {}
+    try:
+        resp = _ec2_client().describe_instances(InstanceIds=ids)
+        for reservation in resp.get("Reservations", []):
+            for inst in reservation.get("Instances", []):
+                states[inst["InstanceId"]] = inst.get("State", {}).get("Name", "unknown")
+    except Exception:  # pragma: no cover - report ids even if describe fails
+        logging.exception("describe_dev_instances_failed")
+    return [
+        {"instance_id": iid, "name": name, "state": states.get(iid, "unknown")}
+        for iid, name in AWS_DEV_INSTANCES.items()
+    ]
+
+
 ACTIONS: dict[str, dict] = {
     "count_customers": {
         "target": "db",
