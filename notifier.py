@@ -24,7 +24,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import urllib.parse
+import uuid
 
 # Map an alert/remediation report to a concrete, allow-listed executor action so
 # the notification can carry real Approve/Reject controls. Deliberately narrow:
@@ -45,6 +47,62 @@ def _base_url() -> str:
 def _recipients() -> list[str]:
     raw = os.environ.get("NOTIFY_TO_EMAILS", "")
     return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+# --- Alert context store (to seed live chat from an email link) ---------------
+# The email's "Open live chat" link carries an unguessable alert id; the Web Chat
+# page fetches the stored RCA via /api/alert-context to continue the same
+# investigation. Reuses the Functions storage account (no new infra).
+_ALERT_TABLE = "alerts"
+
+
+def _alert_table():
+    conn = os.environ.get("AzureWebJobsStorage", "")
+    if not conn:
+        return None
+    from azure.data.tables import TableServiceClient
+
+    service = TableServiceClient.from_connection_string(conn)
+    return service.create_table_if_not_exists(_ALERT_TABLE)
+
+
+def _save_alert_context(alert_id: str, report: str, decision: str,
+                        reason: str, source: str) -> None:
+    try:
+        table = _alert_table()
+        if table is None:
+            return
+        table.upsert_entity(
+            {
+                "PartitionKey": "alert",
+                "RowKey": alert_id,
+                "report": report,
+                "decision": decision,
+                "reason": reason,
+                "source": source,
+                "ts": int(time.time()),
+            }
+        )
+    except Exception:  # pragma: no cover - best effort
+        logging.exception("alert_context_save_failed")
+
+
+def load_alert_context(alert_id: str) -> dict | None:
+    """Return the stored RCA for an alert id, or None. Used by /api/alert-context."""
+    try:
+        table = _alert_table()
+        if table is None:
+            return None
+        entity = table.get_entity("alert", alert_id)
+        return {
+            "report": entity.get("report", ""),
+            "decision": entity.get("decision", ""),
+            "reason": entity.get("reason", ""),
+            "source": entity.get("source", ""),
+        }
+    except Exception:
+        logging.info("alert_context_not_found %s", alert_id)
+        return None
 
 
 def _detect_action(report: str) -> tuple[str, dict] | None:
@@ -90,7 +148,7 @@ def _approval_links(token: str) -> tuple[str, str]:
 
 
 def _build_email(report: str, decision: str, reason: str,
-                 source: str, approval: dict | None) -> tuple[str, str]:
+                 source: str, approval: dict | None, chat_url: str) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the notification email."""
     safe_report = report.replace("<", "&lt;").replace(">", "&gt;")
     lines = [
@@ -127,6 +185,17 @@ def _build_email(report: str, decision: str, reason: str,
         )
 
     color = "#a4262c" if decision == "HOLD" else "#107c10"
+    chat_html = ""
+    if chat_url:
+        text += f"\n\nStill not resolved? Open a live chat about this alert:\n{chat_url}"
+        chat_html = (
+            f'<hr><p style="font-size:13px;color:#444;">Still not resolved after the '
+            f'action above? Continue investigating with the agent (live logs, metrics '
+            f'&amp; further fixes):</p>'
+            f'<p><a href="{chat_url}" style="background:#2b6cb0;color:#fff;'
+            f'padding:10px 18px;text-decoration:none;border-radius:4px;">'
+            f'&#128172; Open live chat about this alert</a></p>'
+        )
     html = (
         f'<div style="font-family:Segoe UI,Arial,sans-serif;max-width:680px;">'
         f'<h2 style="margin-bottom:4px;">DevOps Commander &mdash; alert</h2>'
@@ -136,7 +205,7 @@ def _build_email(report: str, decision: str, reason: str,
         f'&mdash; {reason}</p>'
         f'<pre style="white-space:pre-wrap;background:#f3f2f1;padding:14px;'
         f'border-radius:6px;font-size:13px;">{safe_report}</pre>'
-        f'{approval_html}</div>'
+        f'{approval_html}{chat_html}</div>'
     )
     return text, html
 
@@ -189,8 +258,15 @@ def notify_alert(report: str, decision: str, reason: str, source: str) -> None:
     """
     try:
         approval = _maybe_make_approval(decision, report)
+        # Persist the RCA so the email's "Open live chat" link can seed a
+        # conversation with this incident's context.
+        alert_id = uuid.uuid4().hex
+        _save_alert_context(alert_id, report, decision, reason, source)
+        base = _base_url()
+        chat_url = f"{base}/api/webchat?alert={alert_id}" if base else ""
+
         subject = f"[DevOps Commander] {decision} — {source} alert"
-        text, html = _build_email(report, decision, reason, source, approval)
+        text, html = _build_email(report, decision, reason, source, approval, chat_url)
         _send_email(subject, text, html)
 
         teams_text = f"\U0001f6a8 {source} alert — gate: {decision} ({reason})\n\n{report}"

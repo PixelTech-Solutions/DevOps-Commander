@@ -466,12 +466,43 @@ _WEBCHAT_HTML = """<!DOCTYPE html>
   <script>
     (async function () {
       try {
+        // If opened from an alert email (?alert=<id>), pull that incident's RCA
+        // so the conversation can be auto-seeded and continue the investigation.
+        let seed = '';
+        const alertId = new URLSearchParams(location.search).get('alert');
+        if (alertId) {
+          try {
+            const ctxRes = await fetch('alert-context?id=' + encodeURIComponent(alertId));
+            if (ctxRes.ok) {
+              const ctx = await ctxRes.json();
+              document.getElementById('status').innerText =
+                'Following up on a ' + (ctx.source || 'system') + ' alert (gate: ' +
+                (ctx.decision || '') + ').';
+              seed = 'I am following up on this incident. Please verify whether it ' +
+                'is actually resolved using live logs/metrics, and recommend the next ' +
+                'step if it is not.\\n\\n--- Incident RCA ---\\n' + (ctx.report || '');
+            }
+          } catch (e) { /* non-fatal: chat still opens without seed */ }
+        }
+
         const res = await fetch('directline-token', { method: 'POST' });
         if (!res.ok) { throw new Error('token request failed (' + res.status + ')'); }
         const { token } = await res.json();
+
+        // Auto-send the incident context once Direct Line connects, so the agent
+        // greets the responder with a status check instead of a blank box.
+        const store = window.WebChat.createStore({}, ({ dispatch }) => next => action => {
+          if (seed && action.type === 'DIRECT_LINE/CONNECT_FULFILLED') {
+            dispatch({ type: 'WEB_CHAT/SEND_MESSAGE', payload: { text: seed } });
+            seed = '';
+          }
+          return next(action);
+        });
+
         window.WebChat.renderWebChat(
           {
             directLine: window.WebChat.createDirectLine({ token: token }),
+            store: store,
             styleOptions: {
               botAvatarInitials: 'DC',
               userAvatarInitials: 'You',
@@ -494,3 +525,35 @@ _WEBCHAT_HTML = """<!DOCTYPE html>
 def webchat(req: func.HttpRequest) -> func.HttpResponse:
     """GET /api/webchat — embeddable Web Chat page for DevOps Commander."""
     return func.HttpResponse(_WEBCHAT_HTML, status_code=200, mimetype="text/html")
+
+
+@app.route(route="alert-context", methods=["GET"])
+def alert_context(req: func.HttpRequest) -> func.HttpResponse:
+    """GET /api/alert-context?id=<alert_id> — RCA for an alert, to seed live chat.
+
+    Used by the Web Chat page when opened from an alert email's "Open live chat"
+    link. The id is an unguessable uuid stored by the notifier, so the link works
+    without a shared-secret header (same email-link pattern as /api/approval).
+    Returns only the incident text — no credentials.
+    """
+    alert_id = (req.params.get("id") or "").strip()
+    if not alert_id:
+        return func.HttpResponse(
+            json.dumps({"error": "missing 'id'"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    try:
+        import notifier
+
+        ctx = notifier.load_alert_context(alert_id)
+    except Exception:
+        logging.exception("alert_context_failed")
+        ctx = None
+    if not ctx:
+        return func.HttpResponse(
+            json.dumps({"error": "not found"}),
+            status_code=404,
+            mimetype="application/json",
+        )
+    return func.HttpResponse(json.dumps(ctx), status_code=200, mimetype="application/json")
