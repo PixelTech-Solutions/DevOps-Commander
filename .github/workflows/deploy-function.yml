@@ -122,37 +122,6 @@ jobs:
           scm-do-build-during-deployment: false
           enable-oryx-build: false
 
-      - name: Configure MCP credentials (Datadog + Grafana)
-        # The agent fleet grounds RCA in the team's existing observability via
-        # official remote MCP servers. Their credentials are SECRETS, so they
-        # live in GitHub Actions secrets (not git, not Terraform state) and are
-        # written to Function app settings here. Terraform ignore_changes keeps
-        # `terraform apply` from clobbering them. Each setting is only written
-        # when its secret is present, so a partial config never blanks a key.
-        env:
-          DD_API_KEY: ${{ secrets.DD_API_KEY }}
-          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
-          GRAFANA_SERVICE_ACCOUNT_TOKEN: ${{ secrets.GRAFANA_SERVICE_ACCOUNT_TOKEN }}
-        run: |
-          APP="${{ vars.FUNCTION_APP_NAME }}"
-          RG="$(az functionapp list --query "[?name=='$APP'].resourceGroup | [0]" -o tsv)"
-          if [ -z "$RG" ]; then
-            echo "::error::Could not locate resource group for $APP"
-            exit 1
-          fi
-          settings=()
-          [ -n "$DD_API_KEY" ] && settings+=("DD_API_KEY=$DD_API_KEY")
-          [ -n "$DD_APP_KEY" ] && settings+=("DD_APP_KEY=$DD_APP_KEY")
-          [ -n "$GRAFANA_SERVICE_ACCOUNT_TOKEN" ] && settings+=("GRAFANA_SERVICE_ACCOUNT_TOKEN=$GRAFANA_SERVICE_ACCOUNT_TOKEN")
-          if [ ${#settings[@]} -eq 0 ]; then
-            echo "No MCP secrets provided (DD_API_KEY / DD_APP_KEY / GRAFANA_SERVICE_ACCOUNT_TOKEN)."
-            echo "Add them as repository secrets to enable Datadog/Grafana grounding; skipping."
-            exit 0
-          fi
-          echo "Setting ${#settings[@]} MCP credential app setting(s) (values masked)."
-          az functionapp config appsettings set -g "$RG" -n "$APP" \
-            --settings "${settings[@]}" -o none
-
       - name: Restart + confirm discovered functions
         run: |
           APP="${{ vars.FUNCTION_APP_NAME }}"

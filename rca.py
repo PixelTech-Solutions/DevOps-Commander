@@ -15,8 +15,9 @@ Two prompt agents are referenced by name through the Responses API:
 
 Both attach the Datadog + Grafana MCP servers (read-only) and, when configured,
 the Azure AI Search knowledge tool (RAG). Auth to Foundry is keyless (the
-Function App's user-assigned managed identity, Foundry User role); MCP auth
-rides as request headers sourced from app settings — no secret is committed.
+Function App's user-assigned managed identity, Foundry User role); MCP auth is
+supplied by Foundry "Custom keys" project connections referenced by name (the
+service forbids inline headers) — no secret is committed or kept in app settings.
 
 A deterministic CODE gate (``_enforce_gate``) — not the model — still has the
 final say on whether a fix may proceed automatically. The destructive-action
@@ -38,9 +39,6 @@ from functools import lru_cache
 
 from azure.ai.projects import AIProjectClient
 from azure.ai.projects.models import (
-    AzureAISearchIndex,
-    AzureAISearchTool,
-    AzureAISearchToolResource,
     FunctionTool,
     MCPTool,
     PromptAgentDefinition,
@@ -140,19 +138,21 @@ def _model() -> str:
 def _mcp_tools() -> list:
     """Build the Datadog + Grafana MCP tools from app settings.
 
-    Each MCP server is the vendor's official remote endpoint; auth rides as
-    request headers sourced from app settings (never committed). A server is
-    only attached when both its URL and credentials are present, so the fleet
-    degrades gracefully to base reasoning when observability isn't configured.
-    Read-only: ``require_approval='never'`` keeps queries flowing, and the
-    agent instructions forbid any write tool.
+    Each MCP server is the vendor's official remote endpoint. Auth is supplied
+    by a Foundry "Custom keys" project connection referenced by name via
+    ``project_connection_id`` (the service injects the connection's key/value
+    pairs as request headers and forbids inline ``headers``), so no secret is
+    committed or placed in app settings. A server is attached only when both its
+    URL and connection name are present, so the fleet degrades gracefully to
+    base reasoning when observability isn't configured. Read-only:
+    ``require_approval='never'`` keeps queries flowing, and the agent
+    instructions forbid any write tool.
     """
     tools: list = []
 
     dd_url = os.environ.get("DATADOG_MCP_URL")
-    dd_api = os.environ.get("DD_API_KEY")
-    dd_app = os.environ.get("DD_APP_KEY")
-    if dd_url and dd_api and dd_app:
+    dd_conn = os.environ.get("DATADOG_MCP_CONNECTION", "datadog-mcp")
+    if dd_url and dd_conn:
         tools.append(
             MCPTool(
                 server_label="datadog",
@@ -161,7 +161,7 @@ def _mcp_tools() -> list:
                     "Datadog observability (read-only): host/infra metrics, "
                     "monitors, logs, and APM traces."
                 ),
-                headers={"DD-API-KEY": dd_api, "DD-APPLICATION-KEY": dd_app},
+                project_connection_id=dd_conn,
                 require_approval="never",
             )
         )
@@ -172,8 +172,8 @@ def _mcp_tools() -> list:
         base = os.environ.get("GRAFANA_URL")
         if base:
             g_url = base.rstrip("/") + "/api/mcp"
-    g_token = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN")
-    if g_url and g_token:
+    g_conn = os.environ.get("GRAFANA_MCP_CONNECTION", "grafana-mcp")
+    if g_url and g_conn:
         tools.append(
             MCPTool(
                 server_label="grafana",
@@ -182,7 +182,7 @@ def _mcp_tools() -> list:
                     "Grafana Cloud (read-only): dashboards, Prometheus/Loki "
                     "queries, alert rules, and incidents."
                 ),
-                headers={"Authorization": f"Bearer {g_token}"},
+                project_connection_id=g_conn,
                 require_approval="never",
             )
         )
@@ -193,30 +193,24 @@ def _mcp_tools() -> list:
 def _search_tool():
     """Build the Azure AI Search knowledge tool, or None when RAG isn't configured.
 
-    The prompt-agent runtime references the Search index by the Foundry
-    connection *name* (not the connection id the classic SDK used), so the name
-    is derived from the connection id's trailing ``/connections/<name>`` segment
-    when an explicit name isn't supplied. Best-effort: any build failure simply
-    drops grounding rather than breaking the agent.
+    The prompt-agent service requires ``project_connection_id`` + ``index_name``
+    (the typed ``AzureAISearchTool`` model serializes ``connectionName``, which
+    the service rejects), so the tool is emitted as a plain dict. Best-effort:
+    a missing index/connection simply drops grounding rather than breaking the
+    agent.
     """
     index = os.environ.get("AZURE_AI_SEARCH_INDEX")
-    conn_name = os.environ.get("AZURE_AI_SEARCH_CONNECTION_NAME")
     conn_id = os.environ.get("AZURE_AI_SEARCH_CONNECTION_ID")
-    if not index or (not conn_name and not conn_id):
+    if not index or not conn_id:
         return None
-    if not conn_name and conn_id:
-        conn_name = conn_id.rstrip("/").split("/connections/")[-1].split("/")[0]
-    try:
-        return AzureAISearchTool(
-            azure_ai_search=AzureAISearchToolResource(
-                indexes=[
-                    AzureAISearchIndex(connection_name=conn_name, index_name=index)
-                ]
-            )
-        )
-    except Exception:
-        logging.debug("search_tool_build_failed", exc_info=True)
-        return None
+    return {
+        "type": "azure_ai_search",
+        "azure_ai_search": {
+            "indexes": [
+                {"project_connection_id": conn_id, "index_name": index}
+            ]
+        },
+    }
 
 
 # --- Dev read-only action tools (ChatOps live data) --------------------------
