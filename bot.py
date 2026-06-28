@@ -251,6 +251,7 @@ class CommanderBot(ActivityHandler):
         thread_id = self._threads.get(convo_id) if convo_id else None
 
         reply = "Chat is temporarily unavailable. Please try again."
+        pending = None
         try:
             import rca
 
@@ -260,10 +261,15 @@ class CommanderBot(ActivityHandler):
                 new_thread = result.get("conversation_id")
                 if convo_id and new_thread:
                     self._threads[convo_id] = new_thread
+                pending = result.get("pending_approval")
         except Exception:
             logging.exception("bot_chat_unavailable")
 
         await turn_context.send_activity(MessageFactory.text(reply))
+        if pending and pending.get("requires_approval"):
+            await turn_context.send_activity(
+                MessageFactory.attachment(_approval_card(pending))
+            )
 
     async def _offer_approval(
         self, turn_context: TurnContext, action: str, params: dict

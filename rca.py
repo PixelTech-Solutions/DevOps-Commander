@@ -32,6 +32,7 @@ whose independent safety guarantee is provided by ``_enforce_gate`` in code.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -51,6 +52,13 @@ _CHAT_NAME = "devops-commander-chat"
 
 # Cap on local function-tool round-trips per turn (guards against a tool loop).
 _MAX_TOOL_ITERS = 5
+
+# When a chat turn proposes a destructive cloud action, the function tool stores
+# the executor's signed approval request here so ``analyze_chat`` can hand it to
+# the bot, which renders the Approve/Reject card. Nothing has run at that point.
+_pending_approval: contextvars.ContextVar = contextvars.ContextVar(
+    "pending_approval", default=None
+)
 
 # Azure subscription/tenant the agents should target, read from the environment
 # (never hardcoded in source). When set, the agents are told the exact values so
@@ -141,12 +149,10 @@ _CHAT_INSTRUCTIONS = (
     "- Datadog (read-only): infrastructure/host metrics, monitors, logs, traces.\n"
     "- Grafana Cloud (read-only): dashboards, Prometheus/Loki queries, alert "
     "rules, incidents.\n"
-    "- Azure (manage): resource inventory, Azure Monitor metrics/logs, resource "
-    "health, and management operations (start/stop/restart VMs, run commands, "
-    "scale, config) for the Azure-hosted ERP servers.\n"
-    "- AWS (manage): EC2/SSM/CloudWatch inventory and management (start/stop/"
-    "reboot instances, run commands, read logs/metrics) for the AWS-hosted ERP "
-    "servers.\n"
+    "- Azure (read-only): resource inventory, Azure Monitor metrics/logs, and "
+    "resource health for the Azure-hosted ERP servers. Observation only.\n"
+    "- AWS (read-only): EC2/SSM/CloudWatch inventory, instance status, logs and "
+    "metrics for the AWS-hosted ERP servers. Observation only.\n"
     + _AZURE_TOOL_GUIDANCE +
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
@@ -156,11 +162,9 @@ _CHAT_INSTRUCTIONS = (
     "your answer in what you actually observe. For factual questions about the "
     "systems (hosts, IPs, what runs where, prior incidents), search the "
     "knowledge base FIRST and cite the record; if it genuinely has no answer, "
-    "say so plainly instead of guessing. Keep Datadog and Grafana read-only "
-    "(never modify dashboards, monitors, or alerts). You MAY use the Azure and "
-    "AWS tools to manage the servers (start/stop/restart, run commands) when the "
-    "user asks; for destructive or production-impacting actions, confirm intent "
-    "and route through the approval gate first.\n"
+    "say so plainly instead of guessing. Your observability tools (Datadog, "
+    "Grafana, Azure, AWS) are READ-ONLY: never modify dashboards, monitors, "
+    "alerts, or cloud resources through them.\n"
     "You can ALSO run a small set of READ-ONLY actions against the DEVELOPMENT "
     "environment directly via your tools: count customers, list customers, look "
     "up one customer by id, check whether the erp-backend service is running, "
@@ -170,12 +174,19 @@ _CHAT_INSTRUCTIONS = (
     "dev data, CALL the matching tool and report the real result — do not just "
     "explain how, and do not ask for database credentials (the tools run safely "
     "on the dev VM with no secrets exposed).\n"
-    "You CANNOT run destructive actions (deleting a customer, restarting a "
-    "service) and you CANNOT touch PRODUCTION. If the user asks for either, "
-    "explain exactly what the action would be, which environment and host it "
-    "targets, and that it must go through the approval gate (a human approves "
-    "before anything runs). Never claim to have performed a destructive or "
-    "production action.\n"
+    "For DEVELOPMENT AWS EC2 power changes you have dedicated tools: start_ec2 "
+    "(starts a stopped dev instance immediately), and stop_ec2 / reboot_ec2 "
+    "(DESTRUCTIVE — each returns an approval request and shows the user an "
+    "Approve/Reject card; they do NOT act until a human clicks Approve). When "
+    "the user asks to stop or reboot a dev instance, CALL the tool, then tell "
+    "the user an approval card is shown and they must click Approve. NEVER say "
+    "the instance was stopped or rebooted until it actually is.\n"
+    "Destructive actions (deleting a customer, restarting a service, stopping or "
+    "rebooting an EC2 instance) ALWAYS require human approval, and you can NEVER "
+    "touch PRODUCTION — only the development environment, and only the two known "
+    "dev EC2 instances. If asked for a production change, refuse and explain it "
+    "is blocked in code. Never claim to have performed a destructive or "
+    "production action that has not been approved and executed.\n"
     "CRITICAL — missing data is NOT healthy. Empty query results, 'no data', a "
     "metric that stops reporting, or a host/series that has disappeared do NOT "
     "mean an incident is resolved. For a host that was just alerting, absent "
@@ -408,6 +419,49 @@ def query_dev_telemetry(kql: str, hours: int = 1) -> str:
         return f"Could not run the telemetry query: {exc}"
 
 
+def _cloud_request(action: str, env: str, params: dict) -> str:
+    """Route a cloud control-plane action through the executor.
+
+    Read-only/restorative actions (e.g. starting a stopped instance) run now and
+    report their result. Destructive actions (stop, reboot) do NOT run — the
+    executor returns a signed, single-use approval token, which we stash for the
+    bot to render as an Approve/Reject card. The model is told it is not done.
+    """
+    import executor
+
+    try:
+        result = executor.request_action(action, env, params or {})
+    except executor.ActionError as exc:
+        return f"Could not run {action} on {env}: {exc}"
+    except Exception:
+        logging.exception("chat_cloud_action_failed %s", action)
+        return f"Could not run {action} on {env}: an internal error occurred."
+
+    if result.get("requires_approval"):
+        _pending_approval.set(result)
+        return (
+            "APPROVAL REQUIRED — this has NOT run yet. "
+            + (result.get("summary") or "")
+            + " An Approve/Reject card is now shown to the user; a human must "
+            "click Approve before anything happens. Tell the user you have "
+            "requested approval and they must click Approve — do NOT claim the "
+            "action was performed."
+        )
+    return str(result.get("output") or "Done.")
+
+
+def stop_ec2(instance_id: str) -> str:
+    return _cloud_request("stop_ec2", "aws", {"instance_id": instance_id})
+
+
+def start_ec2(instance_id: str) -> str:
+    return _cloud_request("start_ec2", "aws", {"instance_id": instance_id})
+
+
+def reboot_ec2(instance_id: str) -> str:
+    return _cloud_request("reboot_ec2", "aws", {"instance_id": instance_id})
+
+
 _TOOL_DISPATCH = {
     "count_dev_customers": count_dev_customers,
     "list_dev_customers": list_dev_customers,
@@ -417,6 +471,9 @@ _TOOL_DISPATCH = {
     "dev_disk_usage": dev_disk_usage,
     "dev_vm_metric": dev_vm_metric,
     "query_dev_telemetry": query_dev_telemetry,
+    "stop_ec2": stop_ec2,
+    "start_ec2": start_ec2,
+    "reboot_ec2": reboot_ec2,
 }
 
 
@@ -503,6 +560,42 @@ def _dev_function_tools() -> list:
     ]
 
 
+def _cloud_function_tools() -> list:
+    """FunctionTool definitions for AWS EC2 power management, or [] when no
+    dedicated exec IAM key is configured. Destructive ones (stop, reboot) mint
+    an approval token instead of running; start runs immediately."""
+    try:
+        import executor
+
+        if not executor.aws_is_enabled():
+            return []
+    except Exception:
+        return []
+    _iid = {
+        "instance_id": {
+            "type": "string",
+            "description": "The EC2 instance id, e.g. i-079e547101bf680a2. Development instances only.",
+        }
+    }
+    return [
+        FunctionTool(
+            name="stop_ec2",
+            description="Stop a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT stop the instance by itself.",
+            parameters=_obj(_iid, ["instance_id"]),
+        ),
+        FunctionTool(
+            name="reboot_ec2",
+            description="Reboot a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT reboot by itself.",
+            parameters=_obj(_iid, ["instance_id"]),
+        ),
+        FunctionTool(
+            name="start_ec2",
+            description="Start a stopped DEVELOPMENT AWS EC2 instance. Runs immediately.",
+            parameters=_obj(_iid, ["instance_id"]),
+        ),
+    ]
+
+
 @lru_cache(maxsize=1)
 def _ensure_agents() -> bool:
     """Create-or-update the coordinator and chat agents once per worker process.
@@ -533,7 +626,7 @@ def _ensure_agents() -> bool:
         definition=PromptAgentDefinition(
             model=_model(),
             instructions=_CHAT_INSTRUCTIONS,
-            tools=base + _dev_function_tools(),
+            tools=base + _dev_function_tools() + _cloud_function_tools(),
         ),
     )
     return True
@@ -726,9 +819,14 @@ def analyze_chat(message: str, conversation_id: str | None = None) -> dict | Non
     the same Foundry conversation (and its memory). Returns
     ``{"reply": str, "conversation_id": str}`` or ``None`` on hard failure.
     """
+    _pending_approval.set(None)
     try:
         reply, conv_id = _respond(_CHAT_NAME, (message or "")[:4000], conversation_id)
-        return {"reply": reply or "(no reply)", "conversation_id": conv_id}
+        out = {"reply": reply or "(no reply)", "conversation_id": conv_id}
+        pending = _pending_approval.get()
+        if pending:
+            out["pending_approval"] = pending
+        return out
     except Exception:
         logging.exception("agent_chat_failed")
         return None

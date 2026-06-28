@@ -26,3 +26,7 @@ cryptography==42.0.8
 # Alert notifications: Azure Communication Services email (azure-native, no SMTP
 # server / third-party key). Pure-python, ships cleanly to Linux Consumption.
 azure-communication-email==1.0.0
+# AWS control plane for gated dev EC2 power actions (stop/start/reboot). Pure
+# python (botocore), lazy-imported in executor.py so it only loads when an AWS
+# action actually runs. Scoped IAM key (AWS_EXEC_*) limits it to 2 dev instances.
+boto3==1.35.99

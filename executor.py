@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 
 # --- Target map: ONLY development. Production is intentionally absent. --------
@@ -43,6 +44,18 @@ ENV_TARGETS: dict[str, dict[str, str]] = {
 }
 
 ALLOWED_ENVS = tuple(ENV_TARGETS.keys())
+
+# --- AWS development EC2 allow-list. Production instances are intentionally
+#     absent, so the executor physically refuses to touch them — the same
+#     "safety lives in code, not in a prompt" principle as ENV_TARGETS above.
+#     The agent reaches AWS read-only through the MCP server; only this executor
+#     (behind the approval-token gate) can change EC2 power state. -------------
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_DEV_INSTANCES: dict[str, str] = {
+    "i-079e547101bf680a2": "ec2-erp-dev-db",
+    "i-083032133276a6d9f": "ec2-erp-dev-app",
+}
+_EC2_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 
 
 class ActionError(Exception):
@@ -131,6 +144,63 @@ def _restart_service(_params: dict) -> str:
     )
 
 
+# --- Cloud control-plane actions (AWS EC2 power management). Unlike the VM
+#     actions above, these do NOT run a shell command on a host — they call the
+#     AWS API through a dedicated, least-privilege IAM user whose key is scoped
+#     to start/stop/reboot only the two development instances. The validator
+#     refuses any non-dev instance id in code, before AWS is ever contacted. ---
+def _validate_dev_instance(params: dict) -> str:
+    iid = str(params.get("instance_id", "")).strip()
+    if not _EC2_ID_RE.match(iid):
+        raise ActionError(
+            "parameter 'instance_id' must look like i-0123456789abcdef"
+        )
+    if iid not in AWS_DEV_INSTANCES:
+        raise ActionError(
+            f"instance {iid} is not a development instance; the executor only "
+            f"manages dev EC2 (production is blocked)"
+        )
+    return iid
+
+
+@lru_cache(maxsize=1)
+def _ec2_client():
+    # Imported lazily so the app (and function indexing) never pays for boto3
+    # unless a cloud action is actually invoked.
+    import boto3
+
+    return boto3.client(
+        "ec2",
+        region_name=AWS_REGION,
+        aws_access_key_id=os.environ["AWS_EXEC_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_EXEC_SECRET_ACCESS_KEY"],
+    )
+
+
+def _stop_ec2(params: dict) -> str:
+    iid = _validate_dev_instance(params)
+    state = _ec2_client().stop_instances(InstanceIds=[iid])["StoppingInstances"][0]
+    return (
+        f"{AWS_DEV_INSTANCES[iid]} ({iid}): "
+        f"{state['PreviousState']['Name']} -> {state['CurrentState']['Name']}"
+    )
+
+
+def _start_ec2(params: dict) -> str:
+    iid = _validate_dev_instance(params)
+    state = _ec2_client().start_instances(InstanceIds=[iid])["StartingInstances"][0]
+    return (
+        f"{AWS_DEV_INSTANCES[iid]} ({iid}): "
+        f"{state['PreviousState']['Name']} -> {state['CurrentState']['Name']}"
+    )
+
+
+def _reboot_ec2(params: dict) -> str:
+    iid = _validate_dev_instance(params)
+    _ec2_client().reboot_instances(InstanceIds=[iid])
+    return f"{AWS_DEV_INSTANCES[iid]} ({iid}): reboot requested"
+
+
 ACTIONS: dict[str, dict] = {
     "count_customers": {
         "target": "db",
@@ -180,6 +250,30 @@ ACTIONS: dict[str, dict] = {
         "description": "Restart the erp-backend service on the app server.",
         "build": _restart_service,
     },
+    "stop_ec2": {
+        "kind": "cloud",
+        "env": "aws",
+        "destructive": True,
+        "description": "Stop a development EC2 instance. Param: instance_id (dev only).",
+        "validate": _validate_dev_instance,
+        "run": _stop_ec2,
+    },
+    "reboot_ec2": {
+        "kind": "cloud",
+        "env": "aws",
+        "destructive": True,
+        "description": "Reboot a development EC2 instance. Param: instance_id (dev only).",
+        "validate": _validate_dev_instance,
+        "run": _reboot_ec2,
+    },
+    "start_ec2": {
+        "kind": "cloud",
+        "env": "aws",
+        "destructive": False,
+        "description": "Start a stopped development EC2 instance. Param: instance_id (dev only).",
+        "validate": _validate_dev_instance,
+        "run": _start_ec2,
+    },
 }
 
 
@@ -188,7 +282,7 @@ def list_actions() -> list[dict]:
     return [
         {
             "name": name,
-            "target": spec["target"],
+            "target": spec.get("target") or spec.get("env") or "cloud",
             "destructive": spec["destructive"],
             "description": spec["description"],
         }
@@ -199,6 +293,14 @@ def list_actions() -> list[dict]:
 def is_enabled() -> bool:
     """True when the executor has what it needs to reach Azure."""
     return bool(os.environ.get("AZURE_SUBSCRIPTION_ID"))
+
+
+def aws_is_enabled() -> bool:
+    """True when the executor has a dedicated IAM key to manage dev EC2."""
+    return bool(
+        os.environ.get("AWS_EXEC_ACCESS_KEY_ID")
+        and os.environ.get("AWS_EXEC_SECRET_ACCESS_KEY")
+    )
 
 
 @lru_cache(maxsize=1)
@@ -243,22 +345,33 @@ def _validate(action: str, env: str, params: dict) -> tuple[dict, str]:
     before any token is issued or any VM is contacted.
     """
     # 1. Environment gate — production and anything unknown stop here, in code.
+    spec = ACTIONS.get(action)
+    if spec is None:
+        raise ActionError(f"unknown action '{action}'")
+    # 2. Cloud control-plane actions validate their own (dev-only) target.
+    if spec.get("kind") == "cloud":
+        if env != spec["env"]:
+            raise ActionError(
+                f"action '{action}' runs on '{spec['env']}', not '{env}'"
+            )
+        spec["validate"](params)
+        return spec, None
+    # 3. VM actions: environment + allow-list gates.
     if env not in ENV_TARGETS:
         raise ActionError(
             f"environment '{env}' is not allowed; the executor only operates on "
             f"{', '.join(ALLOWED_ENVS)} (production is blocked)"
         )
-    # 2. Allow-list gate.
-    spec = ACTIONS.get(action)
-    if spec is None:
-        raise ActionError(f"unknown action '{action}'")
-    # 3. Parameter validation happens inside the builder.
+    # 4. Parameter validation happens inside the builder.
     command = spec["build"](params)
     return spec, command
 
 
 def _execute(action: str, env: str, params: dict, spec: dict, command: str) -> dict:
-    """Run an already-validated action on its development VM and audit it."""
+    """Run an already-validated action and audit it."""
+    if spec.get("kind") == "cloud":
+        return _execute_cloud(action, env, params, spec)
+
     target = ENV_TARGETS[env]
     vm_name = target[spec["target"]]
     resource_group = target["resource_group"]
@@ -292,6 +405,37 @@ def _execute(action: str, env: str, params: dict, spec: dict, command: str) -> d
     }
 
 
+def _execute_cloud(action: str, env: str, params: dict, spec: dict) -> dict:
+    """Run an already-validated AWS EC2 action via the scoped IAM key and audit it."""
+    audit = {
+        "action": action,
+        "env": env,
+        "target": spec.get("env"),
+        "params": params,
+        "destructive": spec["destructive"],
+    }
+    logging.info("executor_attempt %s", json.dumps(audit, default=str))
+
+    if not aws_is_enabled():
+        raise ActionError(
+            "AWS executor is not configured (AWS_EXEC_ACCESS_KEY_ID missing)"
+        )
+
+    output = spec["run"](params)
+
+    logging.info(
+        "executor_result %s",
+        json.dumps({**audit, "ok": True, "output_chars": len(output)}, default=str),
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "env": env,
+        "target": spec.get("env"),
+        "output": output,
+    }
+
+
 def _summarize(action: str, env: str, params: dict) -> str:
     """A plain-English description of what a destructive action will do."""
     if action == "delete_customer":
@@ -301,6 +445,17 @@ def _summarize(action: str, env: str, params: dict) -> str:
         )
     if action == "restart_service":
         return f"This will RESTART the erp-backend service on the {env} app server."
+    if action == "stop_ec2":
+        iid = params.get("instance_id")
+        name = AWS_DEV_INSTANCES.get(iid, iid)
+        return (
+            f"This will STOP the {env} EC2 instance {name} ({iid}). It will be "
+            f"unreachable until it is started again."
+        )
+    if action == "reboot_ec2":
+        iid = params.get("instance_id")
+        name = AWS_DEV_INSTANCES.get(iid, iid)
+        return f"This will REBOOT the {env} EC2 instance {name} ({iid})."
     return f"This will run '{action}' on {env}."
 
 
