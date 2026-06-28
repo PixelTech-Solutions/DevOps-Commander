@@ -59,6 +59,10 @@ _COORDINATOR_INSTRUCTIONS = (
     "You have live, read-only observability tools:\n"
     "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
     "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
+    "- Azure (read-only): resource inventory, Azure Monitor metrics/logs, and "
+    "resource health for the Azure-hosted ERP servers.\n"
+    "- AWS (read-only): EC2/CloudWatch host and infrastructure state for the "
+    "AWS-hosted ERP servers.\n"
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: past incidents, runbooks, and the infrastructure inventory "
     "(environments, services, hosts and IPs).\n"
@@ -76,6 +80,22 @@ _COORDINATOR_INSTRUCTIONS = (
     "Command: <the single command or playbook step to run>\n"
     "Risk: <low|medium|high>\n"
     "Approval: <auto-safe | needs-human>\n"
+    "VERIFY BEFORE YOU CONCLUDE — never guess. In order: (1) identify the "
+    "affected host(s) from the alert; (2) establish whether each host is "
+    "actually UP before anything else. If the alert includes a 'Ground truth' "
+    "power-state line, it is AUTHORITATIVE — a VM that is deallocated/stopped "
+    "means the host is DOWN. Otherwise check whether the host's series is still "
+    "reporting in Grafana/Prometheus (absent()/up) and whether the service is "
+    "running; (3) only once liveness is settled, read the relevant metrics/logs "
+    "and search the knowledge base for the runbook.\n"
+    "MISSING DATA IS NOT HEALTHY: empty results, 'no data', or a series that has "
+    "stopped reporting for an alerting host means the host is most likely DOWN "
+    "(an outage) — raise severity, never report it as low or resolved. An alert "
+    "query that uses absent() reporting 100 means the host VANISHED, not that "
+    "memory is high. Never propose a fix that contradicts the ground truth (e.g. "
+    "do not say 'restart node_exporter' when the whole VM is deallocated — the "
+    "fix is to start the VM). If you cannot positively verify the state, say so "
+    "and make the Command the concrete verification step rather than a guess.\n"
     "Treat anything destructive, stateful, data-affecting, restart/scaling, or "
     "production-impacting as needs-human and never auto-approve it. Do not "
     "execute remediation yourself. Be concise and concrete."
@@ -88,6 +108,10 @@ _CHAT_INSTRUCTIONS = (
     "You have live, read-only observability tools:\n"
     "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
     "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
+    "- Azure (read-only): resource inventory, Azure Monitor metrics/logs, and "
+    "resource health for the Azure-hosted ERP servers.\n"
+    "- AWS (read-only): EC2/CloudWatch host and infrastructure state for the "
+    "AWS-hosted ERP servers.\n"
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
     "host and IP), past incidents, and implementation history.\n"
@@ -197,6 +221,47 @@ def _mcp_tools() -> list:
                 require_approval="never",
             )
         )
+
+    # Azure MCP (read-only): Azure control-plane / resource queries — inventory,
+    # Azure Monitor metrics & logs, resource health. Remote endpoint + a
+    # Custom-keys connection whose identity is scoped READ-ONLY (Reader), so any
+    # write tool is denied at the platform, not just discouraged in the prompt.
+    # The connection is optional: set AZURE_MCP_CONNECTION="" for a no-auth host.
+    az_url = os.environ.get("AZURE_MCP_URL")
+    if az_url:
+        az_kwargs = {
+            "server_label": "azure",
+            "server_url": az_url,
+            "server_description": (
+                "Azure (read-only): resource inventory, Azure Monitor "
+                "metrics/logs, and resource health for the Azure-hosted ERP."
+            ),
+            "require_approval": "never",
+        }
+        az_conn = os.environ.get("AZURE_MCP_CONNECTION", "azure-mcp")
+        if az_conn:
+            az_kwargs["project_connection_id"] = az_conn
+        tools.append(MCPTool(**az_kwargs))
+
+    # AWS MCP (read-only): the AWS-managed remote MCP (IAM-scoped, CloudTrail-
+    # audited) or the no-auth AWS Knowledge MCP, covering the AWS half of the
+    # ERP (e.g. erp-aws-app-server-dev) that Azure tools can't see. Same remote
+    # pattern; set AWS_MCP_CONNECTION="" for the no-auth Knowledge endpoint.
+    aws_url = os.environ.get("AWS_MCP_URL")
+    if aws_url:
+        aws_kwargs = {
+            "server_label": "aws",
+            "server_url": aws_url,
+            "server_description": (
+                "AWS (read-only): EC2/CloudWatch host and infrastructure state "
+                "for the AWS-hosted ERP servers."
+            ),
+            "require_approval": "never",
+        }
+        aws_conn = os.environ.get("AWS_MCP_CONNECTION", "aws-mcp")
+        if aws_conn:
+            aws_kwargs["project_connection_id"] = aws_conn
+        tools.append(MCPTool(**aws_kwargs))
 
     return tools
 

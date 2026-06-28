@@ -154,16 +154,58 @@ def query_telemetry(kql: str, hours=1) -> str:
 
 
 def incident_context(host: str = "app", hours: int = 1) -> str:
-    """Fast, deterministic enrichment for the alert path: live CPU snapshot.
+    """Fast, deterministic enrichment for the alert path: ground truth first.
 
-    Kept to a single Azure Monitor call (~1-2s) so it never slows an alert ack
-    or contends with the per-VM Run Command lock. Returns "" when telemetry is
-    unavailable so the caller can simply skip enrichment.
+    Establishes the ONE fact the agent must not guess — is the VM actually
+    powered on — via the authoritative instance view, then adds a live CPU
+    snapshot. Kept to two quick Azure calls so it never slows an alert ack.
+    Returns "" when nothing could be gathered so the caller can skip enrichment.
+    """
+    if not is_enabled():
+        return ""
+    lines: list[str] = []
+    try:
+        state = vm_power_state(host)
+        if state:
+            vm = executor.ENV_TARGETS.get("dev", {}).get(host, host)
+            verdict = "UP" if state.lower() == "running" else "DOWN — VM is not running"
+            lines.append(
+                f"Ground truth (authoritative) — Azure dev {host} VM ({vm}) "
+                f"power state: {state} ({verdict})."
+            )
+    except Exception:
+        logging.debug("incident_context_power_failed", exc_info=True)
+    try:
+        snapshot = vm_metric(host, _DEFAULT_METRIC, hours)
+        if snapshot:
+            lines.append("Live telemetry — " + snapshot)
+    except Exception:
+        logging.debug("incident_context_failed", exc_info=True)
+    return "\n".join(lines)
+
+
+def vm_power_state(host: str = "app") -> str:
+    """Authoritative power state of a dev VM ('app'|'db') via the instance view.
+
+    Returns a short code ('running', 'deallocated', 'stopped', ...) or "" when
+    it cannot be determined. Fast (~1s) and read-only — this is the fact the
+    agent must never infer from metric silence.
     """
     if not is_enabled():
         return ""
     try:
-        return "Live telemetry — " + vm_metric(host, _DEFAULT_METRIC, hours)
+        target = executor.ENV_TARGETS.get("dev", {})
+        vm = target.get(host)
+        if not vm:
+            return ""
+        view = executor._compute_client().virtual_machines.instance_view(
+            target["resource_group"], vm
+        )
+        for status in view.statuses or []:
+            code = getattr(status, "code", "") or ""
+            if code.startswith("PowerState/"):
+                return code.split("/", 1)[1]
+        return ""
     except Exception:
-        logging.debug("incident_context_failed", exc_info=True)
+        logging.debug("vm_power_state_failed", exc_info=True)
         return ""
