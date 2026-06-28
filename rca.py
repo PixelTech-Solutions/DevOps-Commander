@@ -1,26 +1,32 @@
-"""DevOps Commander multi-agent fleet (Foundry Agent Service, Connected Agents).
+"""DevOps Commander — agent fleet on the Foundry prompt-agent runtime.
 
-A coordinator agent receives each alert and delegates to specialist agents that
-are registered as its tools (the Connected Agents pattern). The coordinator
-decides the order in natural language; no hand-coded routing.
+Migrated from the classic Assistants/threads-runs agents (azure-ai-agents) to the
+unified **prompt-agent runtime** (azure-ai-projects 2.x, Responses API) so the
+fleet can ground its analysis in the team's existing observability through
+**official remote MCP servers**:
 
-  coordinator (devops-commander-coordinator)
-    ├─ diagnose_incident   -> devops-commander-rca         (root cause + severity)
-    ├─ propose_remediation -> devops-commander-remediation (safe fix + command)
-    └─ assess_risk         -> devops-commander-risk        (independent approval verdict)
+  * Datadog (US5)  — metrics, monitors, logs, APM traces
+  * Grafana Cloud  — dashboards, Prometheus/Loki queries, alert rules, incidents
 
-After the agents reply, a deterministic CODE gate (_enforce_gate) has the FINAL
-say on whether a fix may proceed automatically or must be held for a human. The
-model proposes; the code disposes — an agent can never approve its own action.
+Two prompt agents are referenced by name through the Responses API:
 
-Everything runs server-side on the Foundry project, authenticated keyless with
-the Function App's user-assigned managed identity (Foundry User role). No API
-key is read or stored. AZURE_CLIENT_ID (an app setting) selects the identity.
+  * devops-commander-coordinator  — one-shot incident RCA for alerts
+  * devops-commander-chat         — multi-turn ChatOps assistant
 
-Each alert gets its own thread (one incident = one conversation). Sub-agents are
-created once and reused across cold starts (looked up by name), so they never
-pile up as duplicates. Connected-agent replies are visible only to the
-coordinator, which compiles the final report returned to the caller.
+Both attach the Datadog + Grafana MCP servers (read-only) and, when configured,
+the Azure AI Search knowledge tool (RAG). Auth to Foundry is keyless (the
+Function App's user-assigned managed identity, Foundry User role); MCP auth
+rides as request headers sourced from app settings — no secret is committed.
+
+A deterministic CODE gate (``_enforce_gate``) — not the model — still has the
+final say on whether a fix may proceed automatically. The destructive-action
+approval flow lives entirely in ``bot.py`` / ``executor.py`` and is untouched by
+this migration: the model proposes, the code disposes.
+
+Why two single agents instead of the old connected-agent coordinator? The
+prompt-agent runtime has no "connected agents as tools" primitive; the same
+diagnose→remediate→assess reasoning is folded into one well-instructed agent
+whose independent safety guarantee is provided by ``_enforce_gate`` in code.
 """
 
 from __future__ import annotations
@@ -30,214 +36,87 @@ import logging
 import os
 from functools import lru_cache
 
-from azure.ai.agents.models import (
-    AzureAISearchQueryType,
-    AzureAISearchTool,
-    ConnectedAgentTool,
-    FunctionTool,
-    ListSortOrder,
-    MessageRole,
-    ToolSet,
-)
 from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import (
+    AzureAISearchIndex,
+    AzureAISearchTool,
+    AzureAISearchToolResource,
+    FunctionTool,
+    MCPTool,
+    PromptAgentDefinition,
+)
 from azure.identity import DefaultAzureCredential
 
-# --- Specialist agents (the "tools" the coordinator delegates to) ------------
-_DIAGNOSE_NAME = "devops-commander-rca"
-_DIAGNOSE_TOOL = "diagnose_incident"
-_DIAGNOSE_INSTRUCTIONS = (
-    "You are the diagnosis specialist for a multi-cloud ERP (Azure + AWS). "
-    "Given a monitoring alert, identify the single most likely root cause and "
-    "its severity. Reply with exactly two short lines:\n"
-    "Root cause: <one sentence>\n"
-    "Severity: <low|medium|high|critical>"
-)
-
-# When the Azure AI Search knowledge base is configured, the diagnosis agent
-# grounds its answer in recorded knowledge and cites the closest match (RAG).
-_DIAGNOSE_RAG_SUFFIX = (
-    "\nYou also have a knowledge tool over recorded ERP knowledge: past "
-    "incidents, the infrastructure inventory (environments, services, and "
-    "server IPs), and implementation history. Before answering, search it for "
-    "records relevant to this alert (e.g. the affected service or host) and let "
-    "the closest matches inform your root cause. Add a third line citing your "
-    "evidence:\n"
-    "Evidence: <id or title of the most relevant knowledge record, or 'none found'>"
-)
-
-_REMEDIATION_NAME = "devops-commander-remediation"
-_REMEDIATION_TOOL = "propose_remediation"
-_REMEDIATION_INSTRUCTIONS = (
-    "You are the remediation specialist for a multi-cloud ERP (Azure + AWS). "
-    "Given a diagnosed incident (root cause + severity), propose the safest "
-    "concrete fix. Reply with exactly three short lines:\n"
-    "Proposed fix: <one sentence describing the action>\n"
-    "Command: <the single command or playbook step to run>\n"
-    "Approval: <auto-safe | needs-human>  (use needs-human for anything "
-    "destructive, stateful, or production-impacting; never recommend running "
-    "destructive actions without human approval)."
-)
-
-# When RAG is configured, the remediation agent grounds its fix in documented
-# runbooks and how similar incidents were resolved before.
-_REMEDIATION_RAG_SUFFIX = (
-    "\nYou also have a knowledge tool over recorded ERP knowledge: runbooks and "
-    "implementation history, the infrastructure inventory, and past incidents "
-    "with their fixes. Before proposing a fix, search it for how similar "
-    "incidents on the affected service or host were resolved and prefer a "
-    "documented procedure over an invented one. Add a fourth line citing it:\n"
-    "Evidence: <id or title of the most relevant runbook/incident, or 'none found'>"
-)
-
-_RISK_NAME = "devops-commander-risk"
-_RISK_TOOL = "assess_risk"
-_RISK_INSTRUCTIONS = (
-    "You are the risk and approval reviewer for a multi-cloud ERP (Azure + AWS). "
-    "You are INDEPENDENT from whoever proposed the fix — never rubber-stamp it. "
-    "Given a proposed fix and its command, judge how dangerous it is to run in "
-    "production. Reply with exactly two short lines:\n"
-    "Risk: <low|medium|high>\n"
-    "Verdict: <auto-safe | needs-human>\n"
-    "Treat anything destructive, stateful, data-affecting, restart/scaling, or "
-    "production-impacting as needs-human. Only genuinely low-risk, read-only or "
-    "trivially reversible actions may be auto-safe."
-)
-
-# When RAG is configured, the risk reviewer grounds its verdict in how similar
-# actions behaved before and whether the target host is production.
-_RISK_RAG_SUFFIX = (
-    "\nYou also have a knowledge tool over recorded ERP knowledge: past "
-    "incidents and their outcomes, plus the infrastructure inventory (which "
-    "hosts are production vs development). Before rating, search it for how the "
-    "proposed command or similar actions behaved previously and whether the "
-    "target host is production. Add a third line citing it:\n"
-    "Evidence: <id or title of the most relevant record, or 'none found'>"
-)
-
-# --- Coordinator (the "main" agent the Function talks to) --------------------
+# --- Agent names (referenced by name through the Responses API) --------------
 _COORDINATOR_NAME = "devops-commander-coordinator"
+_CHAT_NAME = "devops-commander-chat"
+
+# Cap on local function-tool round-trips per turn (guards against a tool loop).
+_MAX_TOOL_ITERS = 5
+
+# --- Instructions ------------------------------------------------------------
 _COORDINATOR_INSTRUCTIONS = (
-    "You are DevOps Commander, the incident coordinator for a multi-cloud ERP. "
-    "For each alert: (1) call diagnose_incident to get the root cause and "
-    "severity, (2) call propose_remediation to get a safe fix for that "
-    "diagnosis, (3) call assess_risk to get an INDEPENDENT risk review of that "
-    "fix. Then compile ONE final report with exactly these lines:\n"
-    "Root cause: ...\n"
+    "You are DevOps Commander, the incident coordinator for a multi-cloud ERP "
+    "(Azure + AWS). For each monitoring alert, produce ONE root-cause report.\n"
+    "You have live, read-only observability tools:\n"
+    "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
+    "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
+    "When an Azure AI Search knowledge tool is available, it holds the ERP "
+    "knowledge base: past incidents, runbooks, and the infrastructure inventory "
+    "(environments, services, hosts and IPs).\n"
+    "Before answering: query Datadog and/or Grafana for the affected service or "
+    "host to ground your analysis in real telemetry, and search the knowledge "
+    "base for relevant prior incidents or runbooks. If the alert includes a "
+    "'Live telemetry' line, treat it as primary evidence. Use ONLY read-only "
+    "queries — never modify dashboards, monitors, or alerts, and never send "
+    "writes through any tool.\n"
+    "Then compile ONE report with exactly these lines:\n"
+    "Root cause: <one sentence>\n"
     "Severity: <low|medium|high|critical>\n"
-    "Evidence: <the knowledge record the diagnosis cited, or 'none'>\n"
-    "Proposed fix: ...\n"
-    "Command: ...\n"
+    "Evidence: <the Datadog/Grafana signal or knowledge record you relied on, or 'none'>\n"
+    "Proposed fix: <one sentence>\n"
+    "Command: <the single command or playbook step to run>\n"
     "Risk: <low|medium|high>\n"
     "Approval: <auto-safe | needs-human>\n"
-    "Use the independent risk reviewer's verdict for the Approval line; if the "
-    "reviewer and the remediation agent disagree, always choose the safer one "
-    "(needs-human). Do not execute anything yourself. Be concise and concrete."
+    "Treat anything destructive, stateful, data-affecting, restart/scaling, or "
+    "production-impacting as needs-human and never auto-approve it. Do not "
+    "execute remediation yourself. Be concise and concrete."
 )
 
-# --- Chat coordinator (ChatOps: a human talks to the fleet in plain language) -
-# Same specialist agents as the alert coordinator, but a conversational persona.
-# Advisory only: it can diagnose and explain, but it cannot execute anything yet
-# (execution arrives in a later step, behind the approval gate).
-_CHAT_COORDINATOR_NAME = "devops-commander-chat"
 _CHAT_INSTRUCTIONS = (
     "You are DevOps Commander, a conversational ChatOps assistant for a "
-    "multi-cloud ERP (Azure + AWS) that spans development and production. "
-    "A human engineer talks to you in plain language to ask about the systems "
-    "and, later, to request operational actions.\n"
-    "You have a knowledge tool (Azure AI Search) over the ERP knowledge base: "
-    "the infrastructure inventory (every environment, service, host and IP "
-    "address), past incidents, and implementation history. For ANY factual "
-    "question about the systems — hosts, IP addresses, what runs where, prior "
-    "incidents — search this knowledge base FIRST and answer from what you "
-    "find, citing the record. If the knowledge base genuinely has no answer, "
-    "say so plainly instead of guessing or deflecting to 'check your "
-    "documentation'.\n"
-    "When the user reports a PROBLEM to troubleshoot, you may also delegate: "
-    "call diagnose_incident for the root cause, propose_remediation for a safe "
-    "fix, and assess_risk for an independent risk opinion.\n"
-    "You CAN run a small set of READ-ONLY actions against the DEVELOPMENT "
-    "environment directly, using your tools: count the customers, list "
-    "customers, look up one customer by id, check whether the erp-backend "
-    "service is running, read recent app logs, and check disk usage. When the "
-    "user asks to SEE or FETCH this live development data, actually CALL the "
-    "matching tool and report the real result — do not merely explain how to "
-    "do it, and do not ask for database credentials (the tools run safely on "
-    "the dev VM with no secrets exposed).\n"
+    "multi-cloud ERP (Azure + AWS) that spans development and production. A "
+    "human engineer talks to you in plain language about the systems.\n"
+    "You have live, read-only observability tools:\n"
+    "- Datadog: infrastructure/host metrics, monitors, logs, and APM traces.\n"
+    "- Grafana Cloud: dashboards, Prometheus/Loki queries, alert rules, incidents.\n"
+    "When an Azure AI Search knowledge tool is available, it holds the ERP "
+    "knowledge base: the infrastructure inventory (every environment, service, "
+    "host and IP), past incidents, and implementation history.\n"
+    "For ANY question about system health or 'why is X slow/down/erroring', "
+    "query Datadog and/or Grafana for the relevant service or host and ground "
+    "your answer in what you actually observe. For factual questions about the "
+    "systems (hosts, IPs, what runs where, prior incidents), search the "
+    "knowledge base FIRST and cite the record; if it genuinely has no answer, "
+    "say so plainly instead of guessing. Use ONLY read-only queries — never "
+    "modify dashboards, monitors, or alerts, and never send writes through any "
+    "tool.\n"
+    "You can ALSO run a small set of READ-ONLY actions against the DEVELOPMENT "
+    "environment directly via your tools: count customers, list customers, look "
+    "up one customer by id, check whether the erp-backend service is running, "
+    "read recent app logs, check disk usage, read an Azure Monitor VM metric "
+    "trend (dev_vm_metric), and run a read-only KQL query over operational "
+    "telemetry (query_dev_telemetry). When the user asks to SEE or FETCH live "
+    "dev data, CALL the matching tool and report the real result — do not just "
+    "explain how, and do not ask for database credentials (the tools run safely "
+    "on the dev VM with no secrets exposed).\n"
     "You CANNOT run destructive actions (deleting a customer, restarting a "
     "service) and you CANNOT touch PRODUCTION. If the user asks for either, "
     "explain exactly what the action would be, which environment and host it "
-    "targets, and that it must go through the approval gate (request it, then "
-    "a human approves) before anything runs. Never claim to have performed a "
-    "destructive or production action. Be concise, friendly, and concrete."
+    "targets, and that it must go through the approval gate (a human approves "
+    "before anything runs). Never claim to have performed a destructive or "
+    "production action. Be concise, friendly, and concrete."
 )
-
-
-# --- Live read-only actions the chat agent may call directly (ChatOps) --------
-# These wrap the dev-only executor and are exposed to the chat model as function
-# tools. ONLY non-destructive actions are exposed; destructive ones still go
-# through the signed approval gate and are never callable from chat. Each returns
-# a short text result the agent reads back to the user.
-def _dev_action(action: str, params: dict | None = None) -> str:
-    import executor
-
-    try:
-        result = executor.run_action(action, "dev", params or {})
-    except executor.ActionError as exc:
-        return f"Could not run {action} on dev: {exc}"
-    except Exception:
-        logging.exception("chat_dev_action_failed %s", action)
-        return f"Could not run {action} on dev: an internal error occurred."
-    return str(result.get("output", "")).strip() or "(no output)"
-
-
-def count_dev_customers() -> str:
-    """Count the rows in the development ERP customers table."""
-    return _dev_action("count_customers")
-
-
-def list_dev_customers(limit: int = 10) -> str:
-    """List customers from the development ERP database.
-
-    :param limit: How many customers to return (1-50). Defaults to 10.
-    """
-    return _dev_action("list_customers", {"limit": limit})
-
-
-def get_dev_customer(customer_id: int) -> str:
-    """Show one development ERP customer by id.
-
-    :param customer_id: The customer id to look up (>= 1).
-    """
-    return _dev_action("get_customer", {"id": customer_id})
-
-
-def dev_service_status() -> str:
-    """Show whether the erp-backend service is running on the dev app server."""
-    return _dev_action("service_status")
-
-
-def dev_recent_app_logs(lines: int = 30) -> str:
-    """Show recent erp-backend logs from the dev app server.
-
-    :param lines: How many log lines to return (1-200). Defaults to 30.
-    """
-    return _dev_action("recent_app_logs", {"lines": lines})
-
-
-def dev_disk_usage() -> str:
-    """Show root filesystem disk usage on the dev app server."""
-    return _dev_action("disk_usage")
-
-
-# The set of read-only functions the chat coordinator may invoke directly.
-_CHAT_FUNCTIONS = {
-    count_dev_customers,
-    list_dev_customers,
-    get_dev_customer,
-    dev_service_status,
-    dev_recent_app_logs,
-    dev_disk_usage,
-}
 
 
 def is_enabled() -> bool:
@@ -257,168 +136,360 @@ def _model() -> str:
     return os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 
 
-def _ensure_agent(name: str, instructions: str, tools=None, tool_resources=None) -> str:
-    """Get-or-create an agent by name; return its id.
+# --- Tools -------------------------------------------------------------------
+def _mcp_tools() -> list:
+    """Build the Datadog + Grafana MCP tools from app settings.
 
-    Looking up by our well-known name keeps cold starts from piling up
-    duplicate agents in the project. When the agent already exists it is
-    updated in place so changes (new instructions, an attached knowledge tool)
-    take effect without anyone deleting and recreating it by hand.
+    Each MCP server is the vendor's official remote endpoint; auth rides as
+    request headers sourced from app settings (never committed). A server is
+    only attached when both its URL and credentials are present, so the fleet
+    degrades gracefully to base reasoning when observability isn't configured.
+    Read-only: ``require_approval='never'`` keeps queries flowing, and the
+    agent instructions forbid any write tool.
     """
-    client = _client()
-    for agent in client.agents.list_agents():
-        if agent.name == name:
-            try:
-                client.agents.update_agent(
-                    agent.id,
-                    model=_model(),
-                    instructions=instructions,
-                    tools=tools or [],
-                    tool_resources=tool_resources,
-                )
-            except Exception:
-                logging.debug("agent_update_failed name=%s", name, exc_info=True)
-            return agent.id
-    created = client.agents.create_agent(
-        model=_model(),
-        name=name,
-        instructions=instructions,
-        tools=tools or [],
-        tool_resources=tool_resources,
-    )
-    return created.id
+    tools: list = []
+
+    dd_url = os.environ.get("DATADOG_MCP_URL")
+    dd_api = os.environ.get("DD_API_KEY")
+    dd_app = os.environ.get("DD_APP_KEY")
+    if dd_url and dd_api and dd_app:
+        tools.append(
+            MCPTool(
+                server_label="datadog",
+                server_url=dd_url,
+                server_description=(
+                    "Datadog observability (read-only): host/infra metrics, "
+                    "monitors, logs, and APM traces."
+                ),
+                headers={"DD-API-KEY": dd_api, "DD-APPLICATION-KEY": dd_app},
+                require_approval="never",
+            )
+        )
+
+    # Accept either the full MCP URL or just the stack base URL.
+    g_url = os.environ.get("GRAFANA_MCP_URL")
+    if not g_url:
+        base = os.environ.get("GRAFANA_URL")
+        if base:
+            g_url = base.rstrip("/") + "/api/mcp"
+    g_token = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN")
+    if g_url and g_token:
+        tools.append(
+            MCPTool(
+                server_label="grafana",
+                server_url=g_url,
+                server_description=(
+                    "Grafana Cloud (read-only): dashboards, Prometheus/Loki "
+                    "queries, alert rules, and incidents."
+                ),
+                headers={"Authorization": f"Bearer {g_token}"},
+                require_approval="never",
+            )
+        )
+
+    return tools
 
 
 def _search_tool():
     """Build the Azure AI Search knowledge tool, or None when RAG isn't configured.
 
-    Requires a Foundry project connection (CONNECTION_ID) to the Search service
-    and the index name. SIMPLE = keyword search, so no embeddings are needed.
-    Absent these settings the diagnosis agent simply runs without grounding.
+    The prompt-agent runtime references the Search index by the Foundry
+    connection *name* (not the connection id the classic SDK used), so the name
+    is derived from the connection id's trailing ``/connections/<name>`` segment
+    when an explicit name isn't supplied. Best-effort: any build failure simply
+    drops grounding rather than breaking the agent.
     """
-    conn_id = os.environ.get("AZURE_AI_SEARCH_CONNECTION_ID")
     index = os.environ.get("AZURE_AI_SEARCH_INDEX")
-    if not conn_id or not index:
+    conn_name = os.environ.get("AZURE_AI_SEARCH_CONNECTION_NAME")
+    conn_id = os.environ.get("AZURE_AI_SEARCH_CONNECTION_ID")
+    if not index or (not conn_name and not conn_id):
         return None
-    return AzureAISearchTool(
-        index_connection_id=conn_id,
-        index_name=index,
-        query_type=AzureAISearchQueryType.SIMPLE,
-        top_k=3,
-    )
-
-
-@lru_cache(maxsize=1)
-def _specialist_tool_defs():
-    """Ensure the three specialist agents exist; return their Connected Agent tool
-    definitions so any coordinator can delegate to them by name.
-
-    Shared by both the alert coordinator and the chat coordinator, so the
-    specialists are created once and reused across the whole fleet.
-    """
-    search = _search_tool()
-    if search is not None:
-        # All three specialists share the same knowledge base, each with a
-        # role-specific instruction on how to use it (diagnosis -> root cause,
-        # remediation -> runbooks, risk -> prior outcomes + prod/dev inventory).
-        diagnose_id = _ensure_agent(
-            _DIAGNOSE_NAME,
-            _DIAGNOSE_INSTRUCTIONS + _DIAGNOSE_RAG_SUFFIX,
-            tools=search.definitions,
-            tool_resources=search.resources,
+    if not conn_name and conn_id:
+        conn_name = conn_id.rstrip("/").split("/connections/")[-1].split("/")[0]
+    try:
+        return AzureAISearchTool(
+            azure_ai_search=AzureAISearchToolResource(
+                indexes=[
+                    AzureAISearchIndex(connection_name=conn_name, index_name=index)
+                ]
+            )
         )
-        remediation_id = _ensure_agent(
-            _REMEDIATION_NAME,
-            _REMEDIATION_INSTRUCTIONS + _REMEDIATION_RAG_SUFFIX,
-            tools=search.definitions,
-            tool_resources=search.resources,
-        )
-        risk_id = _ensure_agent(
-            _RISK_NAME,
-            _RISK_INSTRUCTIONS + _RISK_RAG_SUFFIX,
-            tools=search.definitions,
-            tool_resources=search.resources,
-        )
-    else:
-        diagnose_id = _ensure_agent(_DIAGNOSE_NAME, _DIAGNOSE_INSTRUCTIONS)
-        remediation_id = _ensure_agent(_REMEDIATION_NAME, _REMEDIATION_INSTRUCTIONS)
-        risk_id = _ensure_agent(_RISK_NAME, _RISK_INSTRUCTIONS)
-
-    diagnose_tool = ConnectedAgentTool(
-        id=diagnose_id,
-        name=_DIAGNOSE_TOOL,
-        description="Diagnose the root cause and severity of an incident from its alert.",
-    )
-    remediation_tool = ConnectedAgentTool(
-        id=remediation_id,
-        name=_REMEDIATION_TOOL,
-        description="Propose a safe, concrete fix and command for a diagnosed incident, flagging whether human approval is required.",
-    )
-    risk_tool = ConnectedAgentTool(
-        id=risk_id,
-        name=_RISK_TOOL,
-        description="Independently review a proposed fix and command, rate its risk, and decide whether human approval is required before it may run.",
-    )
-    return (
-        diagnose_tool.definitions
-        + remediation_tool.definitions
-        + risk_tool.definitions
-    )
+    except Exception:
+        logging.debug("search_tool_build_failed", exc_info=True)
+        return None
 
 
-@lru_cache(maxsize=1)
-def _coordinator_id() -> str:
-    """Ensure the specialists + the alert coordinator exist; return coordinator id.
+# --- Dev read-only action tools (ChatOps live data) --------------------------
+# These wrap the dev-only executor and the observability module and are exposed
+# to the CHAT agent as function tools. Only NON-destructive actions are exposed;
+# destructive ones still go through the signed approval gate in bot.py and are
+# never callable from chat. The prompt-agent runtime has no auto-runner, so the
+# response loop in `_respond` executes these locally and feeds the results back.
+def _dev_action(action: str, params: dict | None = None) -> str:
+    import executor
 
-    The coordinator is created with the specialists wired in as Connected Agent
-    tools, so it can delegate to them by name at runtime.
-    """
-    return _ensure_agent(
-        _COORDINATOR_NAME, _COORDINATOR_INSTRUCTIONS, tools=_specialist_tool_defs()
-    )
+    try:
+        result = executor.run_action(action, "dev", params or {})
+    except executor.ActionError as exc:
+        return f"Could not run {action} on dev: {exc}"
+    except Exception:
+        logging.exception("chat_dev_action_failed %s", action)
+        return f"Could not run {action} on dev: an internal error occurred."
+    return str(result.get("output", "")).strip() or "(no output)"
 
 
-@lru_cache(maxsize=1)
-def _chat_coordinator_id() -> str:
-    """Ensure the chat coordinator exists; return its id. It shares the same
-    specialist agents as the alert coordinator AND gets the Azure AI Search
-    knowledge tool directly, so it can answer factual questions about the ERP
-    (hosts, IPs, past incidents) by searching the knowledge base itself."""
-    tools = list(_specialist_tool_defs())
-    tool_resources = None
-    search = _search_tool()
-    if search is not None:
-        tools = search.definitions + tools
-        tool_resources = search.resources
-    # Expose the dev-only read-only executor actions as live function tools, but
-    # only when the executor is configured to reach Azure. The SDK runs these
-    # implementations automatically (enable_auto_function_calls) during
-    # create_and_process, so the chat agent can fetch real data, not just talk.
-    functions = None
+def count_dev_customers() -> str:
+    return _dev_action("count_customers")
+
+
+def list_dev_customers(limit: int = 10) -> str:
+    return _dev_action("list_customers", {"limit": limit})
+
+
+def get_dev_customer(customer_id: int) -> str:
+    return _dev_action("get_customer", {"id": customer_id})
+
+
+def dev_service_status() -> str:
+    return _dev_action("service_status")
+
+
+def dev_recent_app_logs(lines: int = 30) -> str:
+    return _dev_action("recent_app_logs", {"lines": lines})
+
+
+def dev_disk_usage() -> str:
+    return _dev_action("disk_usage")
+
+
+def dev_vm_metric(metric: str = "cpu", host: str = "app", hours: int = 1) -> str:
+    import observability
+
+    if not observability.is_enabled():
+        return "Live metrics are not configured."
+    try:
+        return observability.vm_metric(host, metric, hours)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not read the '{metric}' metric for dev {host}: {exc}"
+
+
+def query_dev_telemetry(kql: str, hours: int = 1) -> str:
+    import observability
+
+    if not observability.is_enabled():
+        return "Live telemetry is not configured."
+    try:
+        return observability.query_telemetry(kql, hours)
+    except Exception as exc:  # noqa: BLE001
+        return f"Could not run the telemetry query: {exc}"
+
+
+_TOOL_DISPATCH = {
+    "count_dev_customers": count_dev_customers,
+    "list_dev_customers": list_dev_customers,
+    "get_dev_customer": get_dev_customer,
+    "dev_service_status": dev_service_status,
+    "dev_recent_app_logs": dev_recent_app_logs,
+    "dev_disk_usage": dev_disk_usage,
+    "dev_vm_metric": dev_vm_metric,
+    "query_dev_telemetry": query_dev_telemetry,
+}
+
+
+def _dispatch_tool(name: str, arguments: str) -> str:
+    """Execute one local function tool call and return its text result."""
+    fn = _TOOL_DISPATCH.get(name)
+    if fn is None:
+        return f"Unknown tool: {name}"
+    try:
+        kwargs = json.loads(arguments) if arguments else {}
+    except Exception:
+        kwargs = {}
+    try:
+        return str(fn(**kwargs))
+    except TypeError as exc:
+        return f"Bad arguments for {name}: {exc}"
+    except Exception:
+        logging.exception("tool_failed %s", name)
+        return f"Tool {name} failed."
+
+
+def _obj(props: dict | None = None, required: list | None = None) -> dict:
+    return {"type": "object", "properties": props or {}, "required": required or []}
+
+
+def _dev_function_tools() -> list:
+    """FunctionTool definitions for the dev read-only actions, or [] when the
+    executor isn't configured to reach Azure."""
     try:
         import executor
 
-        executor_ready = executor.is_enabled()
+        if not executor.is_enabled():
+            return []
     except Exception:
-        executor_ready = False
-    if executor_ready:
-        functions = FunctionTool(functions=_CHAT_FUNCTIONS)
-        tools = tools + functions.definitions
-    agent_id = _ensure_agent(
-        _CHAT_COORDINATOR_NAME,
-        _CHAT_INSTRUCTIONS,
-        tools=tools,
-        tool_resources=tool_resources,
+        return []
+    return [
+        FunctionTool(
+            name="count_dev_customers",
+            description="Count the rows in the development ERP customers table.",
+            parameters=_obj(),
+        ),
+        FunctionTool(
+            name="list_dev_customers",
+            description="List customers from the development ERP database.",
+            parameters=_obj({"limit": {"type": "integer", "description": "How many customers to return (1-50). Default 10."}}),
+        ),
+        FunctionTool(
+            name="get_dev_customer",
+            description="Show one development ERP customer by id.",
+            parameters=_obj({"customer_id": {"type": "integer", "description": "The customer id to look up (>= 1)."}}, ["customer_id"]),
+        ),
+        FunctionTool(
+            name="dev_service_status",
+            description="Show whether the erp-backend service is running on the dev app server.",
+            parameters=_obj(),
+        ),
+        FunctionTool(
+            name="dev_recent_app_logs",
+            description="Show recent erp-backend logs from the dev app server.",
+            parameters=_obj({"lines": {"type": "integer", "description": "How many log lines to return (1-200). Default 30."}}),
+        ),
+        FunctionTool(
+            name="dev_disk_usage",
+            description="Show root filesystem disk usage on the dev app server.",
+            parameters=_obj(),
+        ),
+        FunctionTool(
+            name="dev_vm_metric",
+            description="Show an Azure Monitor metric trend (avg/peak/latest) for a dev ERP VM.",
+            parameters=_obj({
+                "metric": {"type": "string", "description": "cpu | network in | network out | disk read | disk write. Default cpu."},
+                "host": {"type": "string", "description": "Which dev VM: 'app' (erp-backend) or 'db' (MySQL). Default app."},
+                "hours": {"type": "integer", "description": "Hours back to summarize (1-24). Default 1."},
+            }),
+        ),
+        FunctionTool(
+            name="query_dev_telemetry",
+            description="Run a read-only Kusto (KQL) query over operational telemetry (incidents handled, executor actions) recorded in Application Insights.",
+            parameters=_obj({
+                "kql": {"type": "string", "description": "The Kusto query to run, e.g. 'traces | take 5'."},
+                "hours": {"type": "integer", "description": "Time window in hours (1-24). Default 1."},
+            }, ["kql"]),
+        ),
+    ]
+
+
+@lru_cache(maxsize=1)
+def _ensure_agents() -> bool:
+    """Create-or-update the coordinator and chat agents once per worker process.
+
+    ``create_version`` records a new version each call; caching keeps a cold
+    start from minting more than one version per agent. Agents are referenced by
+    name at invoke time, which always resolves to the latest version, so new
+    instructions or tools take effect on the next cold start.
+    """
+    client = _client()
+    base = _mcp_tools()
+    search = _search_tool()
+    if search is not None:
+        base = base + [search]
+
+    client.agents.create_version(
+        _COORDINATOR_NAME,
+        definition=PromptAgentDefinition(
+            model=_model(),
+            instructions=_COORDINATOR_INSTRUCTIONS,
+            tools=base,
+        ),
     )
-    if functions is not None:
-        toolset = ToolSet()
-        toolset.add(functions)
-        _client().agents.enable_auto_function_calls(toolset)
-    return agent_id
+    # The chat agent also gets the dev read-only action tools (executed locally
+    # by the response loop), so ChatOps can fetch live dev data conversationally.
+    client.agents.create_version(
+        _CHAT_NAME,
+        definition=PromptAgentDefinition(
+            model=_model(),
+            instructions=_CHAT_INSTRUCTIONS,
+            tools=base + _dev_function_tools(),
+        ),
+    )
+    return True
 
 
-# A deterministic, code-side human-in-the-loop gate. The agents only advise;
-# this function -- not the model -- decides whether a fix may run automatically.
+# --- Responses API invocation ------------------------------------------------
+def _resp_text(resp) -> str:
+    """Extract the assistant's text from a Responses API result."""
+    text = getattr(resp, "output_text", None)
+    if text:
+        return text.strip()
+    parts: list[str] = []
+    for item in getattr(resp, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for content in getattr(item, "content", None) or []:
+            value = getattr(content, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+            elif value is not None and hasattr(value, "value"):
+                parts.append(value.value)
+    return "\n".join(parts).strip()
+
+
+def _respond(agent_name: str, message: str, conversation_id: str | None = None):
+    """Run one turn against a named agent; return (reply_text, conversation_id).
+
+    A conversation id carries multi-turn memory server-side; when the caller
+    supplies one we reuse it. If a supplied conversation has gone stale (e.g.
+    across a redeploy), we retry once on a fresh conversation so a chat never
+    dies on a dangling id.
+    """
+    client = _client()
+    _ensure_agents()
+    oc = client.get_openai_client()
+    agent_ref = {"agent_reference": {"name": agent_name, "type": "agent_reference"}}
+
+    def _run(conv_id: str) -> str:
+        resp = oc.responses.create(
+            conversation=conv_id,
+            extra_body=agent_ref,
+            input=message,
+        )
+        # The runtime executes MCP/Search server-side, but local dev function
+        # tools run here: drive any function calls to completion before reading
+        # the final text. Capped so a tool loop can never spin forever.
+        for _ in range(_MAX_TOOL_ITERS):
+            calls = [
+                it
+                for it in (getattr(resp, "output", None) or [])
+                if getattr(it, "type", None) == "function_call"
+            ]
+            if not calls:
+                break
+            outputs = [
+                {
+                    "type": "function_call_output",
+                    "call_id": getattr(call, "call_id", None),
+                    "output": _dispatch_tool(
+                        getattr(call, "name", ""), getattr(call, "arguments", "")
+                    ),
+                }
+                for call in calls
+            ]
+            resp = oc.responses.create(
+                conversation=conv_id, extra_body=agent_ref, input=outputs
+            )
+        return _resp_text(resp)
+
+    if conversation_id:
+        try:
+            return _run(conversation_id), conversation_id
+        except Exception:
+            logging.warning("chat_conversation_stale; starting a fresh one", exc_info=True)
+
+    conv_id = oc.conversations.create().id
+    return _run(conv_id), conv_id
+
+
+# --- Deterministic human-in-the-loop gate (code, not the model, decides) -----
 # Any of these substrings in the proposed command marks it as sensitive.
 _SENSITIVE_OPS = (
     "rm ", "rm -", "drop ", "delete", "truncate", "restart", "reboot",
@@ -428,22 +499,19 @@ _SENSITIVE_OPS = (
 
 
 def _enforce_gate(report: str) -> tuple[str, str]:
-    """Deterministic human-in-the-loop gate -- code, not the model, has final say.
+    """Deterministic human-in-the-loop gate — code, not the model, has final say.
 
     Returns (decision, reason). HOLD means a human must approve before anything
-    runs; AUTO-APPROVED means the action is low-risk and reversible. Because
-    nothing is executed yet, this only classifies and records the decision -- but
-    it is the same gate a later execution step will obey.
+    runs; AUTO-APPROVED means the action is low-risk and reversible. Nothing is
+    executed here — it classifies and records the decision, the same gate a
+    later execution step obeys.
     """
     text = report.lower()
-    # 1. If any agent already asked for a human, honor it unconditionally.
     if "needs-human" in text:
         return "HOLD", "an agent flagged the fix as needs-human"
-    # 2. Independently scan the proposed command for sensitive operations.
     for op in _SENSITIVE_OPS:
         if op in text:
             return "HOLD", f"command contains a sensitive operation ('{op.strip()}')"
-    # 3. High/critical incidents always get a human, even for a 'safe' command.
     if "severity: high" in text or "severity: critical" in text:
         return "HOLD", "high/critical severity requires human sign-off"
     return "AUTO-APPROVED", "low-risk, reversible action"
@@ -456,105 +524,48 @@ def _build_user_message(event: dict) -> str:
     return f"Alert source: {source}\nAlert payload:\n{body}"
 
 
-def _extract_answer(messages) -> str | None:
-    """Return the text of the most recent assistant (coordinator) message."""
-    answer = None
-    for message in messages:
-        if message.role != MessageRole.AGENT:
-            continue
-        for content in message.content:
-            text = getattr(content, "text", None)
-            value = getattr(text, "value", None) if text else None
-            if value:
-                answer = value
-    return answer
-
-
+# --- Public interface (unchanged for function_app.py / bot.py) ---------------
 def analyze_alert(event: dict) -> str | None:
     """Run the coordinator over an alert and return its compiled report, or None.
 
-    The coordinator delegates to the diagnosis, remediation, and risk specialists
-    and returns one combined report; a deterministic code gate then appends the
-    final HOLD / AUTO-APPROVED decision. Best-effort: any error is logged and
+    The coordinator grounds its analysis in live Datadog/Grafana telemetry and
+    the knowledge base, then a deterministic code gate appends the final
+    HOLD / AUTO-APPROVED decision. Best-effort: any error is logged and
     swallowed so the caller can still acknowledge the webhook.
     """
     try:
-        client = _client()
-        coordinator_id = _coordinator_id()
-        thread = client.agents.threads.create()
+        content = _build_user_message(event)
+        # Enrich with a fast live-telemetry snapshot so the diagnosis is grounded
+        # even before the agent reaches for its MCP tools. Best-effort only.
         try:
-            client.agents.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=_build_user_message(event),
-            )
-            run = client.agents.runs.create_and_process(
-                thread_id=thread.id,
-                agent_id=coordinator_id,
-            )
-            if run.status == "failed":
-                logging.error("agent_run_failed %s", getattr(run, "last_error", None))
-                return None
-            messages = client.agents.messages.list(
-                thread_id=thread.id,
-                order=ListSortOrder.ASCENDING,
-            )
-            report = _extract_answer(messages)
-            if report:
-                # Code has the final say on whether a human is needed.
-                decision, reason = _enforce_gate(report)
-                report = f"{report}\nGate (enforced in code): {decision} — {reason}"
-            return report
-        finally:
-            # One incident = one thread; clean it up so the project stays tidy.
-            try:
-                client.agents.threads.delete(thread.id)
-            except Exception:
-                logging.debug("thread_cleanup_failed", exc_info=True)
+            import observability
+
+            telemetry = observability.incident_context("app", 1)
+            if telemetry:
+                content = f"{content}\n\n{telemetry}"
+        except Exception:
+            logging.debug("alert_enrich_failed", exc_info=True)
+
+        report, _ = _respond(_COORDINATOR_NAME, content)
+        if report:
+            decision, reason = _enforce_gate(report)
+            report = f"{report}\nGate (enforced in code): {decision} — {reason}"
+        return report or None
     except Exception:
         logging.exception("agent_rca_failed")
         return None
 
 
 def analyze_chat(message: str, conversation_id: str | None = None) -> dict | None:
-    """Run the conversational chat coordinator over a human message (ChatOps).
+    """Run the conversational ChatOps agent over a human message.
 
-    Unlike an alert (one-shot, ephemeral thread), a chat is multi-turn: the
-    caller passes back the ``conversation_id`` we return to keep the same Foundry
-    thread, so the assistant remembers the conversation. Returns
+    Multi-turn: the caller passes back the ``conversation_id`` we return to keep
+    the same Foundry conversation (and its memory). Returns
     ``{"reply": str, "conversation_id": str}`` or ``None`` on hard failure.
     """
     try:
-        client = _client()
-        agent_id = _chat_coordinator_id()
-        # Reuse the caller's thread when given; otherwise start a fresh one.
-        if conversation_id:
-            thread_id = conversation_id
-        else:
-            thread_id = client.agents.threads.create().id
-
-        client.agents.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=(message or "")[:4000],
-        )
-        run = client.agents.runs.create_and_process(
-            thread_id=thread_id,
-            agent_id=agent_id,
-        )
-        if run.status == "failed":
-            logging.error("agent_chat_failed_run %s", getattr(run, "last_error", None))
-            return {
-                "reply": "Sorry, I hit an error processing that. Please try again.",
-                "conversation_id": thread_id,
-            }
-        messages = client.agents.messages.list(
-            thread_id=thread_id,
-            order=ListSortOrder.ASCENDING,
-        )
-        reply = _extract_answer(messages) or "(no reply)"
-        # The chat thread is intentionally kept alive for conversation continuity.
-        return {"reply": reply, "conversation_id": thread_id}
+        reply, conv_id = _respond(_CHAT_NAME, (message or "")[:4000], conversation_id)
+        return {"reply": reply or "(no reply)", "conversation_id": conv_id}
     except Exception:
         logging.exception("agent_chat_failed")
         return None

@@ -1,9 +1,14 @@
 azure-functions==1.21.3
 azure-identity==1.19.0
-azure-ai-projects==1.0.0
-azure-ai-agents>=1.0.0,<2.0.0
+# Foundry prompt-agent runtime (Responses API) — required for official remote
+# MCP tools (Datadog + Grafana). The classic azure-ai-agents SDK has no MCP
+# support, so the agent fleet was migrated to azure-ai-projects 2.x.
+azure-ai-projects>=2.2.0,<3.0.0
 # Action executor: run allow-listed commands on dev VMs via Azure Run Command.
 azure-mgmt-compute==33.0.0
+# Live observability (SRE): Azure Monitor VM metrics + Log Analytics KQL.
+# Pure-python, no native wheels, so it ships cleanly to Linux Consumption.
+azure-monitor-query==1.4.1
 # Single-use approval tokens for destructive actions (Table Storage nonce store).
 azure-data-tables==12.5.0
 # Web Chat front end: Bot Framework endpoint (/api/messages). Runs as the
