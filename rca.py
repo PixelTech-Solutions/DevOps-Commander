@@ -36,6 +36,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 
 from azure.ai.projects import AIProjectClient
@@ -774,10 +775,31 @@ def _fallback_report(event: dict) -> str:
     A human notification must never depend on a flawless agent run (a single
     failing telemetry tool returns a 400 that aborts the whole response). When
     that happens we forward the raw alert flagged needs-human so the gate holds
-    and a person still gets emailed.
+    and a person still gets emailed. We still try to recognise the common
+    "host vanished" signal (an ``absent()`` rule firing) so the message reads as
+    a clear DOWN host rather than a vague analysis failure.
     """
     source = str(event.get("source") or "alert")
     summary = json.dumps(event.get("payload"), default=str)[:1500]
+    blob = summary.lower()
+    host = ""
+    m = re.search(r"(erp-[a-z0-9-]+)", blob)
+    if m:
+        host = m.group(1)
+    down = "absent(" in blob or "no data" in blob or "nodata" in blob
+    if down:
+        who = host or "an ERP host"
+        return (
+            f"Root cause: {who} has stopped reporting telemetry — the host is "
+            "DOWN (powered off / deallocated), not high on memory.\n"
+            "Severity: Medium\n"
+            f"Evidence: {source} alert fired via absent()/no-data: {summary}\n"
+            "Proposed fix: If this VM was stopped intentionally, no action is "
+            "needed — ignore this alert. If not, start the host and confirm the "
+            "node exporter recovers.\n"
+            "Risk: low\n"
+            "Approval: Needs-human"
+        )
     return (
         "Root cause: Automated RCA was unavailable for this alert (the analysis "
         "agent could not complete — e.g. a telemetry tool returned an error), so "
