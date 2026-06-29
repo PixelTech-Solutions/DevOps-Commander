@@ -250,11 +250,12 @@ def _build_email(report: str, decision: str, reason: str,
                     f'border-radius:20px;">{_esc(sev)}</span>'
                 )
             elif label == "Command":
+                cmd = re.sub(r"```[a-zA-Z0-9]*", "", value).replace("`", "").strip()
                 value_html = (
                     f'<div style="margin-top:7px;background:#0d1117;color:#d6deeb;'
                     f'font:13px/1.55 {_MONO};padding:14px 16px;border-radius:8px;'
                     f'border:1px solid #1f2733;word-break:break-all;'
-                    f'white-space:pre-wrap;">{_esc(value)}</div>'
+                    f'white-space:pre-wrap;">{_esc(cmd)}</div>'
                 )
                 rows_html += (
                     f'<tr><td style="padding:0 0 18px;">'
