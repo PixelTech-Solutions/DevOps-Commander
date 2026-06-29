@@ -27,6 +27,7 @@ import re
 import time
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 
 # Map an alert/remediation report to a concrete, allow-listed executor action so
 # the notification can carry real Approve/Reject controls. Deliberately narrow:
@@ -160,65 +161,248 @@ def _approval_links(token: str) -> tuple[str, str]:
     return approve, reject
 
 
+_FONT = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,"
+         "Arial,sans-serif")
+_MONO = "'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace"
+
+# Labels the RCA report is composed of, in display order, with an icon each.
+_REPORT_FIELDS: list[tuple[str, str]] = [
+    ("Root cause", "&#128269;"),     # magnifying glass
+    ("Severity", "&#127777;"),       # thermometer
+    ("Evidence", "&#128202;"),       # bar chart
+    ("Proposed fix", "&#128295;"),   # wrench
+    ("Command", "&#9000;"),          # keyboard-ish
+    ("Risk", "&#9888;"),             # warning
+    ("Approval", "&#9989;"),         # check
+]
+_FIELD_RE = re.compile(
+    r"(?im)^\s*(Root cause|Severity|Evidence|Proposed fix|Command|Risk|"
+    r"Approval|Gate(?:\s*\([^)]*\))?)\s*[:\-\u2014]\s*"
+)
+
+
+def _esc(value: str) -> str:
+    return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _parse_report(report: str) -> dict[str, str]:
+    """Split a labelled RCA report into {label: value}. Empty if unstructured."""
+    matches = list(_FIELD_RE.finditer(report))
+    if not matches:
+        return {}
+    fields: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        raw_label = m.group(1).strip()
+        key = re.sub(r"\s*\(.*\)\s*", "", raw_label).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(report)
+        fields[key] = report[start:end].strip()
+    return fields
+
+
+def _severity_badge(value: str) -> tuple[str, str]:
+    """Return (background_color, label) for a severity string."""
+    v = (value or "").lower()
+    if "critical" in v:
+        return "#b10e1c", "CRITICAL"
+    if "high" in v or "sev1" in v:
+        return "#d13438", "HIGH"
+    if "medium" in v or "moderate" in v or "sev2" in v:
+        return "#c05621", "MEDIUM"
+    if "low" in v or "info" in v:
+        return "#107c10", "LOW"
+    return "#605e5c", (value.strip().upper() if value.strip() else "UNKNOWN")
+
+
 def _build_email(report: str, decision: str, reason: str,
                  source: str, approval: dict | None, chat_url: str) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the notification email."""
-    safe_report = report.replace("<", "&lt;").replace(">", "&gt;")
-    lines = [
-        f"Source: {source}",
+    fields = _parse_report(report)
+
+    # ---- Plain-text part (clean, readable fallback) -------------------------
+    text_lines = [
+        "DEVOPS COMMANDER — INCIDENT REPORT",
+        "==================================",
+        f"Source:        {source}",
         f"Gate decision: {decision} — {reason}",
         "",
-        report,
     ]
-    text = "\n".join(lines)
+    if fields:
+        for label, _ in _REPORT_FIELDS:
+            if label in fields:
+                text_lines.append(f"{label}: {fields[label]}")
+    else:
+        text_lines.append(report)
+    text = "\n".join(text_lines)
 
+    # ---- Structured field rows (HTML) ---------------------------------------
+    rows_html = ""
+    if fields:
+        for label, icon in _REPORT_FIELDS:
+            if label not in fields:
+                continue
+            value = fields[label]
+            if label == "Severity":
+                bg, sev = _severity_badge(value)
+                value_html = (
+                    f'<span style="display:inline-block;background:{bg};color:#fff;'
+                    f'font:700 12px/1 {_FONT};letter-spacing:.04em;padding:5px 12px;'
+                    f'border-radius:20px;">{_esc(sev)}</span>'
+                )
+            elif label == "Command":
+                value_html = (
+                    f'<div style="margin-top:7px;background:#0d1117;color:#d6deeb;'
+                    f'font:13px/1.55 {_MONO};padding:14px 16px;border-radius:8px;'
+                    f'border:1px solid #1f2733;word-break:break-all;'
+                    f'white-space:pre-wrap;">{_esc(value)}</div>'
+                )
+                rows_html += (
+                    f'<tr><td style="padding:0 0 18px;">'
+                    f'<div style="font:700 11px/1 {_FONT};letter-spacing:.09em;'
+                    f'text-transform:uppercase;color:#8a94a6;">{icon}&nbsp; {label}'
+                    f'</div>{value_html}</td></tr>'
+                )
+                continue
+            else:
+                value_html = (
+                    f'<div style="margin-top:5px;font:15px/1.55 {_FONT};'
+                    f'color:#1f2933;">{_esc(value)}</div>'
+                )
+            rows_html += (
+                f'<tr><td style="padding:0 0 18px;">'
+                f'<div style="font:700 11px/1 {_FONT};letter-spacing:.09em;'
+                f'text-transform:uppercase;color:#8a94a6;">{icon}&nbsp; {label}</div>'
+                f'{value_html}</td></tr>'
+            )
+    else:
+        rows_html = (
+            f'<tr><td style="padding:0 0 18px;">'
+            f'<pre style="white-space:pre-wrap;margin:0;background:#f4f6f9;'
+            f'padding:16px;border-radius:8px;font:13px/1.6 {_MONO};color:#1f2933;'
+            f'">{_esc(report)}</pre></td></tr>'
+        )
+
+    # ---- Gate / decision banner ---------------------------------------------
+    hold = decision.upper() == "HOLD"
+    gate_bg = "#fff4e5" if hold else "#e8f5e9"
+    gate_border = "#f0a500" if hold else "#107c10"
+    gate_color = "#8a4b00" if hold else "#0b5d1e"
+    gate_icon = "&#9888;" if hold else "&#9989;"
+    gate_html = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        f'style="margin:0 0 22px;background:{gate_bg};border-left:4px solid '
+        f'{gate_border};border-radius:6px;"><tr>'
+        f'<td style="padding:13px 16px;font:14px/1.5 {_FONT};color:{gate_color};">'
+        f'<span style="font-size:16px;">{gate_icon}</span>&nbsp; '
+        f'<strong>Gate decision: {_esc(decision)}</strong> &mdash; {_esc(reason)}'
+        f'</td></tr></table>'
+    )
+
+    # ---- Approval action panel ----------------------------------------------
     approval_html = ""
-    approval_text = ""
     if approval:
         approve_url, reject_url = _approval_links(approval.get("token", ""))
         summary = approval.get("summary", "An action requires approval.")
         mins = max(1, int(approval.get("expires_in_seconds") or 600) // 60)
-        approval_text = (
-            f"\n\nACTION REQUIRES APPROVAL: {summary}\n"
+        text += (
+            f"\n\n>>> ACTION REQUIRES APPROVAL <<<\n{summary}\n"
             f"Approve: {approve_url}\nReject:  {reject_url}\n"
             f"(expires in {mins} min, single use)"
         )
-        text += approval_text
         approval_html = (
-            f'<hr><p><strong>&#9888;&#65039; Action requires approval:</strong> '
-            f'{summary}</p>'
-            f'<p><a href="{approve_url}" style="background:#107c10;color:#fff;'
-            f'padding:10px 18px;text-decoration:none;border-radius:4px;'
-            f'margin-right:8px;">&#9989; Approve</a>'
-            f'<a href="{reject_url}" style="background:#a4262c;color:#fff;'
-            f'padding:10px 18px;text-decoration:none;border-radius:4px;">'
-            f'&#10060; Reject</a></p>'
-            f'<p style="color:#666;font-size:12px;">Expires in {mins} min, '
-            f'single use.</p>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="margin:6px 0 8px;background:#f8fafc;border:1px solid #e2e8f0;'
+            f'border-radius:10px;"><tr><td style="padding:20px 22px;">'
+            f'<div style="font:700 11px/1 {_FONT};letter-spacing:.09em;'
+            f'text-transform:uppercase;color:#9a3412;">&#9888;&nbsp; '
+            f'Action requires your approval</div>'
+            f'<div style="margin:8px 0 16px;font:15px/1.5 {_FONT};color:#1f2933;">'
+            f'{_esc(summary)}</div>'
+            f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
+            f'<td style="border-radius:8px;background:#107c10;">'
+            f'<a href="{approve_url}" style="display:inline-block;padding:12px 30px;'
+            f'font:700 14px/1 {_FONT};color:#ffffff;text-decoration:none;">'
+            f'&#10003;&nbsp; Approve</a></td>'
+            f'<td style="width:12px;">&nbsp;</td>'
+            f'<td style="border-radius:8px;background:#c1242b;">'
+            f'<a href="{reject_url}" style="display:inline-block;padding:12px 30px;'
+            f'font:700 14px/1 {_FONT};color:#ffffff;text-decoration:none;">'
+            f'&#10007;&nbsp; Reject</a></td>'
+            f'</tr></table>'
+            f'<div style="margin-top:14px;font:12px/1.4 {_FONT};color:#94a3b8;">'
+            f'&#128274; Single-use, expires in {mins} min. No login required.</div>'
+            f'</td></tr></table>'
         )
 
-    color = "#a4262c" if decision == "HOLD" else "#107c10"
+    # ---- Live-chat follow-up ------------------------------------------------
     chat_html = ""
     if chat_url:
-        text += f"\n\nStill not resolved? Open a live chat about this alert:\n{chat_url}"
+        text += f"\n\nStill not resolved? Open a live chat:\n{chat_url}"
         chat_html = (
-            f'<hr><p style="font-size:13px;color:#444;">Still not resolved after the '
-            f'action above? Continue investigating with the agent (live logs, metrics '
-            f'&amp; further fixes):</p>'
-            f'<p><a href="{chat_url}" style="background:#2b6cb0;color:#fff;'
-            f'padding:10px 18px;text-decoration:none;border-radius:4px;">'
-            f'&#128172; Open live chat about this alert</a></p>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="margin-top:18px;"><tr><td style="padding-top:18px;'
+            f'border-top:1px solid #eaecef;">'
+            f'<div style="font:13px/1.55 {_FONT};color:#586069;margin-bottom:12px;">'
+            f'Need to dig deeper? Continue the investigation with the agent &mdash; '
+            f'live logs, metrics and further fixes.</div>'
+            f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
+            f'<td style="border-radius:8px;border:1px solid #d0d7de;background:#ffffff;">'
+            f'<a href="{chat_url}" style="display:inline-block;padding:11px 24px;'
+            f'font:600 14px/1 {_FONT};color:#0969da;text-decoration:none;">'
+            f'&#128172;&nbsp; Open live chat about this alert</a>'
+            f'</td></tr></table></td></tr></table>'
         )
+
+    # ---- Assemble ------------------------------------------------------------
+    sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sev_bg, sev_label = _severity_badge(fields.get("Severity", ""))
     html = (
-        f'<div style="font-family:Segoe UI,Arial,sans-serif;max-width:680px;">'
-        f'<h2 style="margin-bottom:4px;">DevOps Commander &mdash; alert</h2>'
-        f'<p style="margin:0 0 12px;color:#666;">Source: <strong>{source}</strong></p>'
-        f'<p style="font-size:16px;"><strong>Gate decision:</strong> '
-        f'<span style="color:{color};font-weight:bold;">{decision}</span> '
-        f'&mdash; {reason}</p>'
-        f'<pre style="white-space:pre-wrap;background:#f3f2f1;padding:14px;'
-        f'border-radius:6px;font-size:13px;">{safe_report}</pre>'
-        f'{approval_html}{chat_html}</div>'
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '</head>'
+        '<body style="margin:0;padding:0;background:#eef1f5;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="background:#eef1f5;"><tr><td align="center" '
+        'style="padding:28px 14px;">'
+        '<table role="presentation" width="600" cellpadding="0" cellspacing="0" '
+        'style="max-width:600px;width:100%;background:#ffffff;border-radius:14px;'
+        'overflow:hidden;box-shadow:0 2px 10px rgba(20,30,60,.08);">'
+        # Header band
+        '<tr><td style="background:#161a35;padding:24px 28px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+        '<tr><td style="vertical-align:middle;">'
+        f'<div style="font:700 18px/1.2 {_FONT};color:#ffffff;">'
+        '&#128737;&#65039;&nbsp; DevOps Commander</div>'
+        f'<div style="margin-top:3px;font:12px/1.2 {_FONT};color:#9aa4c4;">'
+        'Autonomous SRE &middot; Incident Report</div>'
+        '</td><td align="right" style="vertical-align:middle;">'
+        f'<span style="display:inline-block;background:{sev_bg};color:#fff;'
+        f'font:700 11px/1 {_FONT};letter-spacing:.04em;padding:6px 13px;'
+        f'border-radius:20px;">{_esc(sev_label)}</span>'
+        '</td></tr></table></td></tr>'
+        # Sub-header (source + time)
+        '<tr><td style="padding:20px 28px 4px;">'
+        f'<div style="font:12px/1 {_FONT};color:#8a94a6;text-transform:uppercase;'
+        'letter-spacing:.08em;">Triggered by</div>'
+        f'<div style="margin-top:5px;font:600 17px/1.3 {_FONT};color:#161a35;">'
+        f'{_esc(source)} alert</div>'
+        f'<div style="margin-top:3px;font:12px/1 {_FONT};color:#a0a8b8;">'
+        f'{sent_at}</div></td></tr>'
+        # Body
+        '<tr><td style="padding:20px 28px 8px;">'
+        f'{gate_html}'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+        f'{rows_html}</table>'
+        f'{approval_html}{chat_html}'
+        '</td></tr>'
+        # Footer
+        '<tr><td style="background:#f7f8fa;padding:18px 28px;border-top:'
+        '1px solid #eaecef;">'
+        f'<div style="font:11px/1.5 {_FONT};color:#9aa1ad;">'
+        'This is an automated message from DevOps Commander. Approval links are '
+        'signed, single-use and expire automatically. Do not forward.'
+        '</div></td></tr>'
+        '</table></td></tr></table></body></html>'
     )
     return text, html
 
