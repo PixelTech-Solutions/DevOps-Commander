@@ -88,6 +88,12 @@ _AZURE_TOOL_GUIDANCE = (
     "1-6 hours up to now. NEVER hardcode old dates (e.g. 2023) — metrics older "
     "than ~93 days are out of retention and return 400. If you must pass a start "
     "time, compute it relative to the current time, not a fixed calendar date.\n"
+    "NEVER conclude a host is 'down/deallocated' from absent telemetry alone — "
+    "that is a guess. CONFIRM with compute_vm_get instance-view for the mapped VM "
+    "first. If it reports 'VM running', the host is UP: the issue is the "
+    "monitoring agent / metric pipeline (recommend restarting the agent), NOT a "
+    "VM outage. Only call a VM down when instance-view actually shows stopped/"
+    "deallocated. Cite the power state you observed.\n"
 )
 
 # Alerts label hosts by a friendly DNS-style name; the cloud resources have
