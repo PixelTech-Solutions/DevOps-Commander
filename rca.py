@@ -86,6 +86,23 @@ _AZURE_TOOL_GUIDANCE = (
     "for one named VM, never for a whole resource group at once.\n"
 )
 
+# Alerts label hosts by a friendly DNS-style name; the cloud resources have
+# different names. Map them so the agent never guesses a resource group/VM and
+# 404s. Used as grounding context only — investigation still drives the call.
+_FLEET_INVENTORY = (
+    "ERP FLEET (alert host label -> cloud resource): "
+    "erp-azure-app-server-dev = Azure VM 'vm-erp-dev-app' in RG 'RG-ERP-DEV'; "
+    "erp-azure-db-server-dev = Azure VM 'vm-erp-dev-db' in RG 'RG-ERP-DEV'; "
+    "erp-azure-app-server-prod = Azure VM 'vm-erp-prod-app' in RG 'RG-ERP-PROD'; "
+    "erp-azure-db-server-prod = Azure VM 'vm-erp-prod-db' in RG 'RG-ERP-PROD'; "
+    "erp-aws-app-server-dev = AWS EC2 i-083032133276a6d9f; "
+    "erp-aws-db-server-dev = AWS EC2 i-079e547101bf680a2; "
+    "erp-aws-app-server-prod = AWS EC2 i-0b0e764b1a8718155; "
+    "erp-aws-db-server-prod = AWS EC2 i-0fb4424824abf1893. "
+    "Use exactly these names/RGs; do not invent resource-group names. If a host "
+    "label is missing above, list resources first, never guess.\n"
+)
+
 # --- Instructions ------------------------------------------------------------
 _COORDINATOR_INSTRUCTIONS = (
     "You are DevOps Commander, the incident coordinator for a multi-cloud ERP "
@@ -100,7 +117,7 @@ _COORDINATOR_INSTRUCTIONS = (
     "- AWS (manage): EC2/SSM/CloudWatch inventory plus management actions "
     "(start/stop/reboot instances, run commands, read logs/metrics) for the "
     "AWS-hosted ERP servers.\n"
-    + _AZURE_TOOL_GUIDANCE +
+    + _AZURE_TOOL_GUIDANCE + _FLEET_INVENTORY +
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: past incidents, runbooks, and the infrastructure inventory "
     "(environments, services, hosts and IPs).\n"
@@ -153,7 +170,7 @@ _CHAT_INSTRUCTIONS = (
     "resource health for the Azure-hosted ERP servers. Observation only.\n"
     "- AWS (read-only): EC2/SSM/CloudWatch inventory, instance status, logs and "
     "metrics for the AWS-hosted ERP servers. Observation only.\n"
-    + _AZURE_TOOL_GUIDANCE +
+    + _AZURE_TOOL_GUIDANCE + _FLEET_INVENTORY +
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
     "host and IP), past incidents, and implementation history.\n"
