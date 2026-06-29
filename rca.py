@@ -36,7 +36,6 @@ import contextvars
 import json
 import logging
 import os
-import re
 from functools import lru_cache
 
 from azure.ai.projects import AIProjectClient
@@ -769,41 +768,21 @@ def _build_user_message(event: dict) -> str:
     return f"Alert source: {source}\nAlert payload:\n{body}"
 
 
-def _fallback_report(event: dict) -> str:
+def _fallback_report(event: dict, error: str = "") -> str:
     """A minimal, gate-able report used when the RCA agent cannot complete.
 
     A human notification must never depend on a flawless agent run (a single
     failing telemetry tool returns a 400 that aborts the whole response). When
     that happens we forward the raw alert flagged needs-human so the gate holds
-    and a person still gets emailed. We still try to recognise the common
-    "host vanished" signal (an ``absent()`` rule firing) so the message reads as
-    a clear DOWN host rather than a vague analysis failure.
+    and a person still gets emailed. The agent error is surfaced verbatim so a
+    human can see exactly which tool failed.
     """
     source = str(event.get("source") or "alert")
     summary = json.dumps(event.get("payload"), default=str)[:1500]
-    blob = summary.lower()
-    host = ""
-    m = re.search(r"(erp-[a-z0-9-]+)", blob)
-    if m:
-        host = m.group(1)
-    down = "absent(" in blob or "no data" in blob or "nodata" in blob
-    if down:
-        who = host or "an ERP host"
-        return (
-            f"Root cause: {who} has stopped reporting telemetry — the host is "
-            "DOWN (powered off / deallocated), not high on memory.\n"
-            "Severity: Medium\n"
-            f"Evidence: {source} alert fired via absent()/no-data: {summary}\n"
-            "Proposed fix: If this VM was stopped intentionally, no action is "
-            "needed — ignore this alert. If not, start the host and confirm the "
-            "node exporter recovers.\n"
-            "Risk: low\n"
-            "Approval: Needs-human"
-        )
+    why = f" Agent error: {error}." if error else ""
     return (
         "Root cause: Automated RCA was unavailable for this alert (the analysis "
-        "agent could not complete — e.g. a telemetry tool returned an error), so "
-        "the raw alert is forwarded for human review.\n"
+        f"agent could not complete).{why}\n"
         "Severity: Unknown\n"
         f"Evidence: {source} alert payload: {summary}\n"
         "Proposed fix: A human should inspect the affected host(s) directly. "
@@ -840,9 +819,9 @@ def analyze_alert(event: dict) -> str | None:
         # be notified, so on any agent error we fall back to the raw alert.
         try:
             report, _ = _respond(_COORDINATOR_NAME, content)
-        except Exception:
+        except Exception as exc:
             logging.exception("agent_rca_failed")
-            report = _fallback_report(event)
+            report = _fallback_report(event, f"{type(exc).__name__}: {exc}"[:600])
 
         if report:
             decision, reason = _enforce_gate(report)
