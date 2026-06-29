@@ -36,6 +36,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 from functools import lru_cache
 
 from azure.ai.projects import AIProjectClient
@@ -52,6 +53,13 @@ _CHAT_NAME = "devops-commander-chat"
 
 # Cap on local function-tool round-trips per turn (guards against a tool loop).
 _MAX_TOOL_ITERS = 5
+
+# A single server-side MCP tool error (bad arg syntax, 404, etc.) returns a 400
+# that aborts the whole Responses run. Rather than collapse to a fallback, we
+# re-run telling the agent which tool failed and why, so it self-corrects.
+_MAX_RCA_RETRIES = 4
+# Matches the runtime's "An error occurred invoking 'tool_name': ..." messages.
+_TOOL_ERR_RE = re.compile(r"invoking '([^']+)'\s*:?\s*(.*)", re.DOTALL)
 
 # When a chat turn proposes a destructive cloud action, the function tool stores
 # the executor's signed approval request here so ``analyze_chat`` can hand it to
@@ -714,6 +722,24 @@ def _resp_text(resp) -> str:
     return "\n".join(parts).strip()
 
 
+def _tool_error_note(exc: Exception) -> str | None:
+    """If ``exc`` is a server-side MCP/tool failure, return a short corrective
+    note (which tool failed and why) to feed back into a retry; else None.
+
+    A single tool 400 aborts the whole Responses run, so we detect those and
+    let the agent try again with the failure spelled out, instead of giving up.
+    """
+    text = str(exc)
+    if "tool_user_error" not in text and "invoking '" not in text:
+        return None
+    match = _TOOL_ERR_RE.search(text)
+    if not match:
+        return "a tool call failed; avoid that call or fix its arguments"
+    tool = match.group(1)
+    detail = " ".join(match.group(2).split())[:300]
+    return f"tool '{tool}' failed: {detail}"
+
+
 def _respond(agent_name: str, message: str, conversation_id: str | None = None):
     """Run one turn against a named agent; return (reply_text, conversation_id).
 
@@ -727,11 +753,11 @@ def _respond(agent_name: str, message: str, conversation_id: str | None = None):
     oc = client.get_openai_client()
     agent_ref = {"agent_reference": {"name": agent_name, "type": "agent_reference"}}
 
-    def _run(conv_id: str) -> str:
+    def _run(conv_id: str, text: str) -> str:
         resp = oc.responses.create(
             conversation=conv_id,
             extra_body=agent_ref,
-            input=message,
+            input=text,
         )
         # The runtime executes MCP/Search server-side, but local dev function
         # tools run here: drive any function calls to completion before reading
@@ -759,14 +785,52 @@ def _respond(agent_name: str, message: str, conversation_id: str | None = None):
             )
         return _resp_text(resp)
 
+    def _run_resilient(base_text: str) -> tuple[str, str]:
+        """Run a turn, and if a server-side tool 400 aborts it, re-run with the
+        failing tool/error fed back so the agent corrects itself.
+
+        Each attempt uses a fresh conversation (the errored turn can leave the
+        prior one in a half-finished state) and accumulates "avoid" notes for
+        every tool call that has failed so far. Returns (reply_text, conv_id).
+        """
+        avoid: list[str] = []
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RCA_RETRIES):
+            text = base_text
+            if avoid:
+                text = (
+                    base_text
+                    + "\n\nIMPORTANT — earlier tool attempts in this incident "
+                    "FAILED. Do NOT repeat them; fix the arguments or use a "
+                    "different tool/source instead:\n"
+                    + "\n".join(f"- {note}" for note in avoid)
+                )
+            conv_id = oc.conversations.create().id
+            try:
+                return _run(conv_id, text), conv_id
+            except Exception as exc:  # noqa: BLE001
+                note = _tool_error_note(exc)
+                if note is None:
+                    raise
+                last_exc = exc
+                avoid.append(note)
+                logging.warning(
+                    "rca_tool_error attempt=%s note=%s", attempt + 1, note
+                )
+        # Exhausted retries on tool errors — surface the last one.
+        raise last_exc if last_exc else RuntimeError("RCA retries exhausted")
+
     if conversation_id:
         try:
-            return _run(conversation_id), conversation_id
-        except Exception:
-            logging.warning("chat_conversation_stale; starting a fresh one", exc_info=True)
+            return _run(conversation_id, message), conversation_id
+        except Exception as exc:
+            if _tool_error_note(exc) is None:
+                logging.warning(
+                    "chat_conversation_stale; starting a fresh one", exc_info=True
+                )
+            # Fall through to the resilient fresh-conversation path below.
 
-    conv_id = oc.conversations.create().id
-    return _run(conv_id), conv_id
+    return _run_resilient(message)
 
 
 # --- Deterministic human-in-the-loop gate (code, not the model, decides) -----
