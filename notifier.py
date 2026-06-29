@@ -34,6 +34,15 @@ import uuid
 _RESTART_RE = re.compile(r"\brestart(?:ing|s|ed)?\b", re.I)
 _SERVICE_RE = re.compile(r"\b(?:erp[-_ ]?backend|backend|service)\b", re.I)
 _DELETE_CUSTOMER_RE = re.compile(r"\b(?:delete|remove|drop)\b.*?customer\D*(\d+)", re.I)
+# A deallocated/stopped dev Azure VM whose fix is to start it. Match an explicit
+# "start the VM" / "az vm start" intent and capture the dev VM name anywhere in
+# the report. Restricted to the two known dev VMs so prod is never targeted.
+_VM_NAME_RE = re.compile(r"\b(vm-erp-dev-(?:app|db))\b", re.I)
+_START_VM_RE = re.compile(
+    r"\b(?:az\s+vm\s+start|start(?:ing)?\s+(?:the\s+)?vm|vm\s+start|"
+    r"start\s+the\s+(?:deallocated|stopped)\s+vm|power[\s-]?on)\b",
+    re.I,
+)
 
 
 def _base_url() -> str:
@@ -110,6 +119,10 @@ def _detect_action(report: str) -> tuple[str, dict] | None:
     match = _DELETE_CUSTOMER_RE.search(report)
     if match:
         return "delete_customer", {"id": int(match.group(1))}
+    # Deallocated dev VM whose remediation is to start it.
+    vm = _VM_NAME_RE.search(report)
+    if vm and _START_VM_RE.search(report):
+        return "start_vm", {"vm": vm.group(1).lower()}
     if _RESTART_RE.search(report) and _SERVICE_RE.search(report):
         return "restart_service", {}
     return None

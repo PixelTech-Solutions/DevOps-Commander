@@ -134,6 +134,10 @@ _RESTART_RE = re.compile(r"\brestart(?:ing|s|ed)?\b", re.I)
 _SERVICE_RE = re.compile(r"\b(?:erp[-_ ]?backend|backend|service|server|app)\b", re.I)
 _DELETE_RE = re.compile(r"\b(?:delete|remove|drop)\b", re.I)
 _CUSTOMER_ID_RE = re.compile(r"customer\D*(\d+)", re.I)
+_VM_NAME_RE = re.compile(r"\b(vm-erp-dev-(?:app|db))\b", re.I)
+_VM_START_RE = re.compile(r"\b(?:start|power[\s-]?on|boot)\b", re.I)
+_VM_STOP_RE = re.compile(r"\b(?:stop|deallocate|shut\s*down|power[\s-]?off)\b", re.I)
+_VM_RESTART_RE = re.compile(r"\b(?:restart|reboot)\b", re.I)
 
 
 def _detect_destructive(text: str) -> tuple[str, dict] | None:
@@ -143,6 +147,16 @@ def _detect_destructive(text: str) -> tuple[str, dict] | None:
     the chat coordinator. Returning a match never executes anything — it just
     triggers the approval card, which still requires a human button click.
     """
+    # Explicit Azure VM power command naming a known dev VM.
+    vm = _VM_NAME_RE.search(text)
+    if vm:
+        name = vm.group(1).lower()
+        if _VM_STOP_RE.search(text):
+            return "stop_vm", {"vm": name}
+        if _VM_RESTART_RE.search(text):
+            return "restart_vm", {"vm": name}
+        if _VM_START_RE.search(text):
+            return "start_vm", {"vm": name}
     if _RESTART_RE.search(text) and _SERVICE_RE.search(text):
         return "restart_service", {}
     if _DELETE_RE.search(text) and "customer" in text.lower():

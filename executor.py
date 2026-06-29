@@ -57,6 +57,17 @@ AWS_DEV_INSTANCES: dict[str, str] = {
 }
 _EC2_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 
+# --- Azure development VM allow-list (control-plane power management). Like the
+#     AWS instances above, production VMs are intentionally absent so the
+#     executor physically refuses to start/stop/restart anything but dev. The
+#     agent reads VM state read-only through MCP; only this executor (behind the
+#     approval-token gate) can change Azure VM power state. --------------------
+AZURE_DEV_VMS: dict[str, str] = {
+    "vm-erp-dev-app": "rg-erp-dev",
+    "vm-erp-dev-db": "rg-erp-dev",
+}
+_VM_NAME_RE = re.compile(r"^vm-erp-dev-(?:app|db)$")
+
 
 class ActionError(Exception):
     """A request that the executor refuses or cannot carry out safely."""
@@ -224,6 +235,64 @@ def describe_dev_instances() -> list[dict]:
     ]
 
 
+# --- Azure VM control-plane actions. Like the EC2 actions, these call the Azure
+#     control plane (not a shell on the host) through the Function managed
+#     identity, whose custom role is scoped to start/stop/restart only the dev
+#     VMs. The validator refuses any non-dev VM name in code, before Azure is
+#     ever contacted. -----------------------------------------------------------
+def _validate_dev_vm(params: dict) -> str:
+    vm = str(params.get("vm", "")).strip()
+    if not _VM_NAME_RE.match(vm) or vm not in AZURE_DEV_VMS:
+        raise ActionError(
+            f"VM '{vm}' is not a development VM; the executor only manages "
+            f"{', '.join(AZURE_DEV_VMS)} (production is blocked)"
+        )
+    return vm
+
+
+def _vm_power_state(vm: str) -> str:
+    """Read back a VM's power state code, e.g. 'PowerState/running'."""
+    try:
+        view = _compute_client().virtual_machines.instance_view(
+            AZURE_DEV_VMS[vm], vm
+        )
+        for status in view.statuses or []:
+            code = getattr(status, "code", "") or ""
+            if code.startswith("PowerState/"):
+                return code
+    except Exception:  # pragma: no cover - best effort read-back
+        logging.exception("vm_power_state_failed %s", vm)
+    return "PowerState/unknown"
+
+
+def _azure_vm_op(vm: str, begin: str) -> str:
+    client = _compute_client()
+    rg = AZURE_DEV_VMS[vm]
+    getattr(client.virtual_machines, begin)(rg, vm).result()
+    return f"{vm}: {begin.removeprefix('begin_')} completed; {_vm_power_state(vm)}"
+
+
+def _start_vm(params: dict) -> str:
+    return _azure_vm_op(_validate_dev_vm(params), "begin_start")
+
+
+def _stop_vm(params: dict) -> str:
+    # Deallocate (not just power off) so the stopped VM stops billing compute.
+    return _azure_vm_op(_validate_dev_vm(params), "begin_deallocate")
+
+
+def _restart_vm(params: dict) -> str:
+    return _azure_vm_op(_validate_dev_vm(params), "begin_restart")
+
+
+def describe_dev_vms() -> list[dict]:
+    """Deterministic, read-only listing of the managed dev Azure VMs + state."""
+    rows = []
+    for vm, rg in AZURE_DEV_VMS.items():
+        rows.append({"vm": vm, "resource_group": rg, "state": _vm_power_state(vm)})
+    return rows
+
+
 ACTIONS: dict[str, dict] = {
     "count_customers": {
         "target": "db",
@@ -296,6 +365,30 @@ ACTIONS: dict[str, dict] = {
         "description": "Start a stopped development EC2 instance. Param: instance_id (dev only).",
         "validate": _validate_dev_instance,
         "run": _start_ec2,
+    },
+    "start_vm": {
+        "kind": "azurevm",
+        "env": "dev",
+        "destructive": True,
+        "description": "Start a stopped/deallocated development Azure VM (restores service). Param: vm (dev only). Requires approval.",
+        "validate": _validate_dev_vm,
+        "run": _start_vm,
+    },
+    "stop_vm": {
+        "kind": "azurevm",
+        "env": "dev",
+        "destructive": True,
+        "description": "Deallocate (stop) a development Azure VM. Param: vm (dev only). Requires approval.",
+        "validate": _validate_dev_vm,
+        "run": _stop_vm,
+    },
+    "restart_vm": {
+        "kind": "azurevm",
+        "env": "dev",
+        "destructive": True,
+        "description": "Restart a development Azure VM. Param: vm (dev only). Requires approval.",
+        "validate": _validate_dev_vm,
+        "run": _restart_vm,
     },
 }
 
@@ -372,7 +465,7 @@ def _validate(action: str, env: str, params: dict) -> tuple[dict, str]:
     if spec is None:
         raise ActionError(f"unknown action '{action}'")
     # 2. Cloud control-plane actions validate their own (dev-only) target.
-    if spec.get("kind") == "cloud":
+    if spec.get("kind") in ("cloud", "azurevm"):
         if env != spec["env"]:
             raise ActionError(
                 f"action '{action}' runs on '{spec['env']}', not '{env}'"
@@ -394,6 +487,8 @@ def _execute(action: str, env: str, params: dict, spec: dict, command: str) -> d
     """Run an already-validated action and audit it."""
     if spec.get("kind") == "cloud":
         return _execute_cloud(action, env, params, spec)
+    if spec.get("kind") == "azurevm":
+        return _execute_azure_vm(action, env, params, spec)
 
     target = ENV_TARGETS[env]
     vm_name = target[spec["target"]]
@@ -459,6 +554,35 @@ def _execute_cloud(action: str, env: str, params: dict, spec: dict) -> dict:
     }
 
 
+def _execute_azure_vm(action: str, env: str, params: dict, spec: dict) -> dict:
+    """Run an already-validated Azure VM power action via the Function MI and audit it."""
+    audit = {
+        "action": action,
+        "env": env,
+        "target": "azurevm",
+        "params": params,
+        "destructive": spec["destructive"],
+    }
+    logging.info("executor_attempt %s", json.dumps(audit, default=str))
+
+    if not is_enabled():
+        raise ActionError("executor is not configured (AZURE_SUBSCRIPTION_ID missing)")
+
+    output = spec["run"](params)
+
+    logging.info(
+        "executor_result %s",
+        json.dumps({**audit, "ok": True, "output_chars": len(output)}, default=str),
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "env": env,
+        "target": "azurevm",
+        "output": output,
+    }
+
+
 def _summarize(action: str, env: str, params: dict) -> str:
     """A plain-English description of what a destructive action will do."""
     if action == "delete_customer":
@@ -479,6 +603,18 @@ def _summarize(action: str, env: str, params: dict) -> str:
         iid = params.get("instance_id")
         name = AWS_DEV_INSTANCES.get(iid, iid)
         return f"This will REBOOT the {env} EC2 instance {name} ({iid})."
+    if action == "start_vm":
+        return (
+            f"This will START the {env} Azure VM {params.get('vm')} to restore "
+            f"service availability."
+        )
+    if action == "stop_vm":
+        return (
+            f"This will DEALLOCATE (stop) the {env} Azure VM {params.get('vm')}. "
+            f"It will be unreachable until it is started again."
+        )
+    if action == "restart_vm":
+        return f"This will RESTART the {env} Azure VM {params.get('vm')}."
     return f"This will run '{action}' on {env}."
 
 

@@ -230,6 +230,19 @@ _CHAT_INSTRUCTIONS = (
     "to stop or reboot a dev instance, CALL the tool with that id, then tell the "
     "user an approval card is shown and they must click Approve. NEVER say the "
     "instance was stopped or rebooted until it actually is.\n"
+    "For DEVELOPMENT Azure VM power changes you have dedicated tools: start_vm "
+    "(start a stopped/deallocated dev VM to restore service), stop_vm "
+    "(deallocate a dev VM) and restart_vm. ALL THREE are gated: each returns an "
+    "approval request and shows the user an Approve/Reject card; they do NOT act "
+    "until a human clicks Approve. The managed dev VMs are vm-erp-dev-app and "
+    "vm-erp-dev-db. When the user refers to a VM by role or host label (e.g. "
+    "'the dev app server' / 'erp-azure-app-server-dev'), use the mapping above "
+    "to resolve the real VM name, or call list_dev_vms to confirm the name and "
+    "current power state first. When an incident is caused by a deallocated/"
+    "stopped Azure VM and the fix is to start it, CALL start_vm with that VM "
+    "name, then tell the user an approval card is shown and they must click "
+    "Approve. NEVER say the VM was started, stopped, or restarted until it "
+    "actually is.\n"
     "Destructive actions (deleting a customer, restarting a service, stopping or "
     "rebooting an EC2 instance) ALWAYS require human approval, and you can NEVER "
     "touch PRODUCTION — only the development environment, and only the two known "
@@ -527,6 +540,32 @@ def list_dev_ec2() -> str:
     )
 
 
+def start_vm(vm: str) -> str:
+    return _cloud_request("start_vm", "dev", {"vm": vm})
+
+
+def stop_vm(vm: str) -> str:
+    return _cloud_request("stop_vm", "dev", {"vm": vm})
+
+
+def restart_vm(vm: str) -> str:
+    return _cloud_request("restart_vm", "dev", {"vm": vm})
+
+
+def list_dev_vms() -> str:
+    """Deterministic lookup of the managed dev Azure VMs (name, state)."""
+    import executor
+
+    try:
+        rows = executor.describe_dev_vms()
+    except Exception:
+        logging.exception("list_dev_vms_failed")
+        return "Could not list dev Azure VMs."
+    if not rows:
+        return "No development Azure VMs are configured."
+    return "\n".join(f"{r['vm']}: {r['state']}" for r in rows)
+
+
 _TOOL_DISPATCH = {
     "count_dev_customers": count_dev_customers,
     "list_dev_customers": list_dev_customers,
@@ -540,6 +579,10 @@ _TOOL_DISPATCH = {
     "stop_ec2": stop_ec2,
     "start_ec2": start_ec2,
     "reboot_ec2": reboot_ec2,
+    "list_dev_vms": list_dev_vms,
+    "start_vm": start_vm,
+    "stop_vm": stop_vm,
+    "restart_vm": restart_vm,
 }
 
 
@@ -632,39 +675,73 @@ def _cloud_function_tools() -> list:
     an approval token instead of running; start runs immediately."""
     try:
         import executor
-
-        if not executor.aws_is_enabled():
-            return []
     except Exception:
         return []
-    _iid = {
-        "instance_id": {
-            "type": "string",
-            "description": "The EC2 instance id, e.g. i-079e547101bf680a2. Development instances only.",
+
+    tools: list = []
+    if executor.aws_is_enabled():
+        _iid = {
+            "instance_id": {
+                "type": "string",
+                "description": "The EC2 instance id, e.g. i-079e547101bf680a2. Development instances only.",
+            }
         }
-    }
-    return [
-        FunctionTool(
-            name="list_dev_ec2",
-            description="List the managed DEVELOPMENT AWS EC2 instances with their real instance id and live power state. Use this to find an instance id before any power action.",
-            parameters=_obj(),
-        ),
-        FunctionTool(
-            name="stop_ec2",
-            description="Stop a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT stop the instance by itself.",
-            parameters=_obj(_iid, ["instance_id"]),
-        ),
-        FunctionTool(
-            name="reboot_ec2",
-            description="Reboot a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT reboot by itself.",
-            parameters=_obj(_iid, ["instance_id"]),
-        ),
-        FunctionTool(
-            name="start_ec2",
-            description="Start a stopped DEVELOPMENT AWS EC2 instance. Runs immediately.",
-            parameters=_obj(_iid, ["instance_id"]),
-        ),
-    ]
+        tools += [
+            FunctionTool(
+                name="list_dev_ec2",
+                description="List the managed DEVELOPMENT AWS EC2 instances with their real instance id and live power state. Use this to find an instance id before any power action.",
+                parameters=_obj(),
+            ),
+            FunctionTool(
+                name="stop_ec2",
+                description="Stop a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT stop the instance by itself.",
+                parameters=_obj(_iid, ["instance_id"]),
+            ),
+            FunctionTool(
+                name="reboot_ec2",
+                description="Reboot a DEVELOPMENT AWS EC2 instance. Destructive: this returns an approval request (a human must click Approve); it does NOT reboot by itself.",
+                parameters=_obj(_iid, ["instance_id"]),
+            ),
+            FunctionTool(
+                name="start_ec2",
+                description="Start a stopped DEVELOPMENT AWS EC2 instance. Runs immediately.",
+                parameters=_obj(_iid, ["instance_id"]),
+            ),
+        ]
+
+    # Azure VM power management uses the Function managed identity (no extra key),
+    # so it is available whenever the executor can reach Azure. Every action here
+    # returns an approval request — a human must click Approve before it runs.
+    if executor.is_enabled():
+        _vm = {
+            "vm": {
+                "type": "string",
+                "description": "The Azure VM name: vm-erp-dev-app or vm-erp-dev-db. Development VMs only.",
+            }
+        }
+        tools += [
+            FunctionTool(
+                name="list_dev_vms",
+                description="List the managed DEVELOPMENT Azure VMs with their live power state (running/deallocated). Use this to confirm a VM name and state before any power action.",
+                parameters=_obj(),
+            ),
+            FunctionTool(
+                name="start_vm",
+                description="Start a stopped/deallocated DEVELOPMENT Azure VM to restore service. Returns an approval request (a human must click Approve); it does NOT start the VM by itself.",
+                parameters=_obj(_vm, ["vm"]),
+            ),
+            FunctionTool(
+                name="stop_vm",
+                description="Deallocate (stop) a DEVELOPMENT Azure VM. Returns an approval request (a human must click Approve); it does NOT stop the VM by itself.",
+                parameters=_obj(_vm, ["vm"]),
+            ),
+            FunctionTool(
+                name="restart_vm",
+                description="Restart a DEVELOPMENT Azure VM. Returns an approval request (a human must click Approve); it does NOT restart the VM by itself.",
+                parameters=_obj(_vm, ["vm"]),
+            ),
+        ]
+    return tools
 
 
 @lru_cache(maxsize=1)
