@@ -84,6 +84,10 @@ _AZURE_TOOL_GUIDANCE = (
     "compute_vm_get without instance-view), then for power state call the VM "
     "with a specific vm-name — the instance-view/power-state option only works "
     "for one named VM, never for a whole resource group at once.\n"
+    "When querying Azure Monitor metrics, ALWAYS use a RECENT window: the last "
+    "1-6 hours up to now. NEVER hardcode old dates (e.g. 2023) — metrics older "
+    "than ~93 days are out of retention and return 400. If you must pass a start "
+    "time, compute it relative to the current time, not a fixed calendar date.\n"
 )
 
 # Alerts label hosts by a friendly DNS-style name; the cloud resources have
