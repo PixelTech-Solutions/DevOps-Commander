@@ -22,6 +22,13 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 def _classify_source(user_agent: str, body: dict | None) -> str:
     """Best-effort tag for which monitoring tool sent the alert."""
+    # 1) Trust an explicit source declared in the payload — the Datadog/Grafana
+    #    webhook templates set this themselves, so it is the most reliable signal
+    #    (User-Agent and body shape are only fallbacks for clients that don't).
+    if isinstance(body, dict):
+        declared = str(body.get("source") or "").strip().lower()
+        if declared in ("datadog", "grafana", "alertmanager", "prometheus"):
+            return "grafana" if declared in ("alertmanager", "prometheus") else declared
     ua = (user_agent or "").lower()
     if "datadog" in ua:
         return "datadog"
