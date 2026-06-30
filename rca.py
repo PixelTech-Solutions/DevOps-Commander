@@ -8,10 +8,16 @@ fleet can ground its analysis in the team's existing observability through
   * Datadog (US5)  — metrics, monitors, logs, APM traces
   * Grafana Cloud  — dashboards, Prometheus/Loki queries, alert rules, incidents
 
-Two prompt agents are referenced by name through the Responses API:
+A connected, hierarchical multi-agent fleet is referenced by name through the
+Responses API. The Coordinator is an ORCHESTRATOR that delegates to specialist
+sub-agents (exposed to it as function tools - the agent-as-tool pattern), so the
+agents collaborate on one incident instead of working in isolation:
 
-  * devops-commander-coordinator  — one-shot incident RCA for alerts
-  * devops-commander-chat         — multi-turn ChatOps assistant
+  * devops-commander-coordinator  - orchestrator: plans, delegates, compiles
+  * devops-commander-diagnostics  - telemetry RCA specialist (read-only)
+  * devops-commander-remediation  - fix-proposal specialist (never executes)
+  * devops-commander-pipeline     - CI/CD failure triage specialist
+  * devops-commander-chat         - multi-turn ChatOps assistant (can delegate)
 
 Both attach the Datadog + Grafana MCP servers (read-only) and, when configured,
 the Azure AI Search knowledge tool (RAG). Auth to Foundry is keyless (the
@@ -24,10 +30,13 @@ final say on whether a fix may proceed automatically. The destructive-action
 approval flow lives entirely in ``bot.py`` / ``executor.py`` and is untouched by
 this migration: the model proposes, the code disposes.
 
-Why two single agents instead of the old connected-agent coordinator? The
-prompt-agent runtime has no "connected agents as tools" primitive; the same
-diagnose→remediate→assess reasoning is folded into one well-instructed agent
-whose independent safety guarantee is provided by ``_enforce_gate`` in code.
+The prompt-agent runtime has no built-in "connected agents as tools" primitive,
+so delegation is implemented explicitly: each specialist is wrapped as a local
+function tool (``consult_diagnostics`` / ``consult_remediation`` /
+``consult_pipeline``) that the Coordinator (and Chat) can call; the response loop
+runs the sub-agent and feeds its analysis back to the orchestrator. The
+independent safety guarantee remains a deterministic ``_enforce_gate`` in code -
+the model proposes, the code disposes.
 """
 
 from __future__ import annotations
@@ -51,6 +60,9 @@ from azure.identity import DefaultAzureCredential
 _COORDINATOR_NAME = "devops-commander-coordinator"
 _CHAT_NAME = "devops-commander-chat"
 _PIPELINE_NAME = "devops-commander-pipeline"
+# Specialist sub-agents the Coordinator delegates to (connected-agent topology).
+_DIAGNOSTICS_NAME = "devops-commander-diagnostics"
+_REMEDIATION_NAME = "devops-commander-remediation"
 
 # Cap on local function-tool round-trips per turn (guards against a tool loop).
 _MAX_TOOL_ITERS = 5
@@ -126,31 +138,31 @@ _FLEET_INVENTORY = (
 
 # --- Instructions ------------------------------------------------------------
 _COORDINATOR_INSTRUCTIONS = (
-    "You are DevOps Commander, the incident coordinator for a multi-cloud ERP "
-    "(Azure + AWS). For each monitoring alert, produce ONE root-cause report.\n"
-    "You have these live tools:\n"
-    "- Datadog (read-only): infrastructure/host metrics, monitors, logs, traces.\n"
-    "- Grafana Cloud (read-only): dashboards, Prometheus/Loki queries, alert "
-    "rules, incidents.\n"
-    "- Azure (manage): inventory, Azure Monitor metrics/logs, resource health, "
-    "and management actions (start/stop/restart VMs, run commands, scale) for "
-    "the Azure-hosted ERP servers.\n"
-    "- AWS (manage): EC2/SSM/CloudWatch inventory plus management actions "
-    "(start/stop/reboot instances, run commands, read logs/metrics) for the "
-    "AWS-hosted ERP servers.\n"
+    "You are DevOps Commander, the incident COORDINATOR (orchestrator) for a "
+    "multi-cloud ERP (Azure + AWS). You LEAD a team of specialist agents and "
+    "delegate through your tools instead of doing all the work yourself. For "
+    "each monitoring alert, orchestrate the team and produce ONE root-cause "
+    "report.\n"
+    "Your specialist team (call them via your tools):\n"
+    "- consult_diagnostics(incident): the diagnostics specialist grounds the "
+    "root cause in live Datadog/Grafana/Azure Monitor/AWS telemetry and the "
+    "knowledge base, returning affected host(s), root cause, severity and "
+    "evidence.\n"
+    "- consult_remediation(diagnosis): the remediation specialist turns a "
+    "confirmed diagnosis into ONE minimal, safe proposed fix (command, risk, "
+    "approval). It only proposes; it never executes.\n"
+    "- consult_pipeline(details): the CI/CD specialist triages a failed GitHub "
+    "Actions run; use it only when the incident is a pipeline/CI failure.\n"
+    "You also keep your OWN live tools (Datadog/Grafana read-only, Azure/AWS, "
+    "knowledge base) to verify a specialist's finding or fill a gap, but prefer "
+    "delegating the deep investigation.\n"
     + _AZURE_TOOL_GUIDANCE + _FLEET_INVENTORY +
-    "When an Azure AI Search knowledge tool is available, it holds the ERP "
-    "knowledge base: past incidents, runbooks, and the infrastructure inventory "
-    "(environments, services, hosts and IPs).\n"
-    "Before answering: query Datadog and/or Grafana for the affected service or "
-    "host to ground your analysis in real telemetry, and search the knowledge "
-    "base for relevant prior incidents or runbooks. If the alert includes a "
-    "'Live telemetry' line, treat it as primary evidence. Keep Datadog and "
-    "Grafana read-only (never modify dashboards, monitors, or alerts). You MAY "
-    "use the Azure and AWS tools to investigate and to carry out remediation, "
-    "but anything destructive, stateful, data-affecting, or production-impacting "
-    "must be marked needs-human and not auto-run.\n"
-    "Then compile ONE report with exactly these lines:\n"
+    "WORKFLOW for every alert:\n"
+    "1. Call consult_diagnostics with the COMPLETE alert context (include any "
+    "'Live telemetry' line) and read back the grounded diagnosis.\n"
+    "2. Call consult_remediation with that diagnosis to obtain the proposed "
+    "fix, command, risk and approval.\n"
+    "3. Compile ONE final report with EXACTLY these lines:\n"
     "Root cause: <one sentence>\n"
     "Severity: <low|medium|high|critical>\n"
     "Evidence: <the Datadog/Grafana signal or knowledge record you relied on, or 'none'>\n"
@@ -158,22 +170,11 @@ _COORDINATOR_INSTRUCTIONS = (
     "Command: <the single command or playbook step to run>\n"
     "Risk: <low|medium|high>\n"
     "Approval: <auto-safe | needs-human>\n"
-    "INVESTIGATE THE REAL CAUSE — never guess and never stop at the first "
-    "plausible answer. Identify the affected host(s), then enumerate ALL "
-    "candidate causes and rule them in or out with read-only evidence before "
-    "concluding. Use every tool you have: Grafana/Datadog for CPU, memory, disk, "
-    "I/O, network, OOM kills, swap, restarts and the absent()/up series; Azure "
-    "Monitor/AWS CloudWatch for power state, health, deployments and quota; the "
-    "knowledge base for prior incidents and runbooks; and read-only remote "
-    "commands (Azure VM run-command / AWS SSM) for ground truth on the host — "
-    "service status, recent logs, disk usage, top processes, recent config or "
-    "package changes. Consider the full range: host down, agent/exporter crash, "
-    "genuine resource exhaustion (mem/disk/CPU), OOM, a dependency or network "
-    "outage, a bad deploy/config change, throttling, certificate/auth failure. "
-    "Branch your checks on what each command returns; keep digging until the "
-    "evidence points to one cause. Read-only diagnostics auto-approve; only the "
-    "final remediation is needs-human. If the data is genuinely insufficient, "
-    "say so and make the Command the next read-only step, not a fix.\n"
+    "Base the report on what the specialists returned; do not invent findings "
+    "they did not report. If consult_diagnostics could not ground a cause, keep "
+    "digging with your own read-only tools or make the Command the next "
+    "read-only diagnostic step rather than guessing. Read-only diagnostics "
+    "auto-approve; the final remediation is needs-human.\n"
     "MISSING DATA IS NOT HEALTHY: empty results, 'no data', or a series that has "
     "stopped reporting for an alerting host means the host is most likely DOWN "
     "(an outage) — raise severity, never report it as low or resolved. An alert "
@@ -202,6 +203,9 @@ _CHAT_INSTRUCTIONS = (
     "When an Azure AI Search knowledge tool is available, it holds the ERP "
     "knowledge base: the infrastructure inventory (every environment, service, "
     "host and IP), past incidents, and implementation history.\n"
+    "For a DEEP root-cause investigation you may DELEGATE to the diagnostics "
+    "specialist via the consult_diagnostics tool and relay its grounded "
+    "analysis to the engineer.\n"
     "For ANY question about system health or 'why is X slow/down/erroring', "
     "query Datadog and/or Grafana for the relevant service or host and ground "
     "your answer in what you actually observe. For factual questions about the "
@@ -311,6 +315,54 @@ _PIPELINE_INSTRUCTIONS = (
     "explain why in the report \u2014 do NOT invent a change.\n"
     "Always end with Approval: needs-human \u2014 a human approves before anything "
     "is committed."
+)
+
+
+# --- Specialist sub-agent instructions (connected-agent topology) ------------
+_DIAGNOSTICS_INSTRUCTIONS = (
+    "You are DevOps Commander's DIAGNOSTICS specialist. The incident Coordinator "
+    "calls you to investigate ONE incident and return a grounded root-cause "
+    "analysis. You have read-only observability tools (Datadog, Grafana), Azure "
+    "and AWS read tools, and the Azure AI Search knowledge base.\n"
+    + _AZURE_TOOL_GUIDANCE + _FLEET_INVENTORY +
+    "Investigate with REAL telemetry: query Datadog/Grafana for the affected "
+    "service or host (CPU, memory, disk, I/O, network, OOM, restarts, the "
+    "absent()/up series), use Azure Monitor / AWS CloudWatch for power state, "
+    "health, deployments and quota, and confirm a host is actually up or down "
+    "with compute_vm_get instance-view rather than inferring from absent "
+    "metrics. Search the knowledge base for prior incidents and runbooks.\n"
+    "Return EXACTLY these labelled lines:\n"
+    "Affected host(s): <the resource(s) involved>\n"
+    "Root cause: <one sentence, the single most likely cause>\n"
+    "Severity: <low|medium|high|critical>\n"
+    "Evidence: <the specific signals/records you relied on>\n"
+    "Confidence: <low|medium|high>\n"
+    "You are READ-ONLY: never modify dashboards, monitors, alerts or cloud "
+    "resources, and do NOT propose or execute a remediation - that is the "
+    "remediation specialist's job. MISSING DATA IS NOT HEALTHY: empty results "
+    "or a series that has stopped reporting for an alerting host most likely "
+    "means it is DOWN - say so and raise severity. If evidence is genuinely "
+    "insufficient, say what the next read-only check should be. Be concise and "
+    "evidence-based."
+)
+
+_REMEDIATION_INSTRUCTIONS = (
+    "You are DevOps Commander's REMEDIATION specialist. The incident Coordinator "
+    "gives you a confirmed diagnosis; you propose the SINGLE minimal, safe "
+    "corrective action. You may use read-only tools to sanity-check the "
+    "diagnosis, but you NEVER execute anything.\n"
+    + _FLEET_INVENTORY +
+    "Return EXACTLY these labelled lines:\n"
+    "Proposed fix: <one sentence>\n"
+    "Command: <the single command or playbook step to run>\n"
+    "Risk: <low|medium|high>\n"
+    "Approval: <auto-safe | needs-human>\n"
+    "Anything destructive, stateful, data-affecting, restart/scaling, or "
+    "PRODUCTION-impacting MUST be Approval: needs-human - never auto-approve it. "
+    "Never propose a fix that contradicts the evidence (e.g. do not 'restart "
+    "node_exporter' when the VM is deallocated - start the VM). If the diagnosis "
+    "is insufficient for a safe fix, make the Command the next read-only "
+    "diagnostic step and set Approval: needs-human. Be concise and concrete."
 )
 
 
@@ -639,7 +691,42 @@ def list_dev_vms() -> str:
     return "\n".join(f"{r['vm']}: {r['state']}" for r in rows)
 
 
+# --- Connected-agent delegation (agent-as-tool) ------------------------------
+# Wrap each specialist sub-agent as a local function tool so the Coordinator (and
+# Chat) can DELEGATE to it: the response loop runs the named agent as its own
+# turn and feeds the analysis back to the orchestrator. Specialists carry only
+# the base MCP/Search tools, so they cannot recurse back here.
+def consult_diagnostics(incident: str) -> str:
+    try:
+        reply, _ = _respond(_DIAGNOSTICS_NAME, (incident or "")[:6000])
+        return reply or "(diagnostics specialist returned no analysis)"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("consult_diagnostics_failed")
+        return f"Diagnostics specialist unavailable: {type(exc).__name__}: {exc}"[:500]
+
+
+def consult_remediation(diagnosis: str) -> str:
+    try:
+        reply, _ = _respond(_REMEDIATION_NAME, (diagnosis or "")[:6000])
+        return reply or "(remediation specialist returned no proposal)"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("consult_remediation_failed")
+        return f"Remediation specialist unavailable: {type(exc).__name__}: {exc}"[:500]
+
+
+def consult_pipeline(details: str) -> str:
+    try:
+        reply, _ = _respond(_PIPELINE_NAME, (details or "")[:6000])
+        return reply or "(pipeline specialist returned no triage)"
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("consult_pipeline_failed")
+        return f"Pipeline specialist unavailable: {type(exc).__name__}: {exc}"[:500]
+
+
 _TOOL_DISPATCH = {
+    "consult_diagnostics": consult_diagnostics,
+    "consult_remediation": consult_remediation,
+    "consult_pipeline": consult_pipeline,
     "count_dev_customers": count_dev_customers,
     "list_dev_customers": list_dev_customers,
     "get_dev_customer": get_dev_customer,
@@ -817,6 +904,29 @@ def _cloud_function_tools() -> list:
     return tools
 
 
+def _orchestration_tools() -> list:
+    """FunctionTool definitions that let the Coordinator and Chat DELEGATE to
+    specialist sub-agents (the agent-as-tool pattern that makes the fleet
+    connected rather than isolated)."""
+    return [
+        FunctionTool(
+            name="consult_diagnostics",
+            description="Delegate to the diagnostics specialist agent. Pass the FULL alert/incident context; get back a grounded root-cause analysis (affected host, root cause, severity, evidence) from live Datadog/Grafana/Azure/AWS telemetry and the knowledge base. Use this FIRST for every incident.",
+            parameters=_obj({"incident": {"type": "string", "description": "The full alert/incident context to investigate."}}, ["incident"]),
+        ),
+        FunctionTool(
+            name="consult_remediation",
+            description="Delegate to the remediation specialist agent. Pass the confirmed diagnosis; get back a minimal, safe proposed fix (Proposed fix, Command, Risk, Approval). It only PROPOSES and never executes. Use this AFTER consult_diagnostics.",
+            parameters=_obj({"diagnosis": {"type": "string", "description": "The confirmed root-cause diagnosis to remediate."}}, ["diagnosis"]),
+        ),
+        FunctionTool(
+            name="consult_pipeline",
+            description="Delegate to the CI/CD pipeline-triage specialist when the incident is a GitHub Actions failure. Pass the failed run details; get back the root cause and a proposed fix.",
+            parameters=_obj({"details": {"type": "string", "description": "The failed pipeline run details (repo, run id, branch, sha, etc.)."}}, ["details"]),
+        ),
+    ]
+
+
 @lru_cache(maxsize=1)
 def _ensure_agents() -> bool:
     """Create-or-update the coordinator and chat agents once per worker process.
@@ -831,23 +941,47 @@ def _ensure_agents() -> bool:
     search = _search_tool()
     if search is not None:
         base = base + [search]
+    model = _model()
+    orchestration = _orchestration_tools()
 
+    # Specialist sub-agents the Coordinator delegates to. Each carries only the
+    # read-only MCP/Search base (no orchestration tools), so a specialist can
+    # never recurse back into the orchestrator.
     client.agents.create_version(
-        _COORDINATOR_NAME,
+        _DIAGNOSTICS_NAME,
         definition=PromptAgentDefinition(
-            model=_model(),
-            instructions=_COORDINATOR_INSTRUCTIONS,
+            model=model,
+            instructions=_DIAGNOSTICS_INSTRUCTIONS,
             tools=base,
         ),
     )
+    client.agents.create_version(
+        _REMEDIATION_NAME,
+        definition=PromptAgentDefinition(
+            model=model,
+            instructions=_REMEDIATION_INSTRUCTIONS,
+            tools=base,
+        ),
+    )
+    # The Coordinator is the ORCHESTRATOR: base tools PLUS the agent-as-tool
+    # delegation tools, so it leads the specialists on one incident.
+    client.agents.create_version(
+        _COORDINATOR_NAME,
+        definition=PromptAgentDefinition(
+            model=model,
+            instructions=_COORDINATOR_INSTRUCTIONS,
+            tools=base + orchestration,
+        ),
+    )
     # The chat agent also gets the dev read-only action tools (executed locally
-    # by the response loop), so ChatOps can fetch live dev data conversationally.
+    # by the response loop) and can delegate deep RCA to the diagnostics
+    # specialist, so ChatOps can both fetch live dev data and reason in depth.
     client.agents.create_version(
         _CHAT_NAME,
         definition=PromptAgentDefinition(
-            model=_model(),
+            model=model,
             instructions=_CHAT_INSTRUCTIONS,
-            tools=base + _dev_function_tools() + _cloud_function_tools(),
+            tools=base + _dev_function_tools() + _cloud_function_tools() + orchestration,
         ),
     )
     # The pipeline-triage agent gets the same read-only base (incl. GitHub MCP)
@@ -855,7 +989,7 @@ def _ensure_agents() -> bool:
     client.agents.create_version(
         _PIPELINE_NAME,
         definition=PromptAgentDefinition(
-            model=_model(),
+            model=model,
             instructions=_PIPELINE_INSTRUCTIONS,
             tools=base,
         ),
