@@ -176,8 +176,8 @@ _REPORT_FIELDS: list[tuple[str, str]] = [
     ("Approval", "&#9989;"),         # check
 ]
 _FIELD_RE = re.compile(
-    r"(?im)^\s*(Root cause|Severity|Evidence|Proposed fix|Command|Risk|"
-    r"Approval|Gate(?:\s*\([^)]*\))?)\s*[:\-\u2014]\s*"
+    r"(?im)^[ \t>#*_-]*(Root cause|Severity|Evidence|Proposed fix|Command|Risk|"
+    r"Approval|Gate(?:\s*\([^)]*\))?)\**[ \t]*[:\-\u2014][ \t]*\**[ \t]*"
 )
 
 
