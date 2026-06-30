@@ -511,21 +511,112 @@ _WEBCHAT_HTML = """<!DOCTYPE html>
   <script crossorigin="anonymous"
           src="https://cdn.botframework.com/botframework-webchat/latest/webchat.js"></script>
   <style>
-    html, body { height: 100%; margin: 0; font-family: 'Segoe UI', Arial, sans-serif; }
-    #app { display: flex; flex-direction: column; height: 100%; background: #f3f5f8; }
-    #header { background: #2b6cb0; color: #fff; padding: 14px 20px; font-weight: 600;
-              font-size: 18px; letter-spacing: .2px; }
-    #header span { font-weight: 400; opacity: .85; font-size: 13px; }
-    #webchat { flex: 1 1 auto; max-width: 820px; width: 100%; margin: 0 auto; }
-    #status { padding: 12px 20px; color: #c05621; }
+    :root {
+      --brand: #2b6cb0; --brand-dark: #1e4e8c; --brand-bg: #ebf4ff;
+      --ink: #1a202c; --muted: #64748b; --line: #e2e8f0; --amber: #c05621;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0;
+      font-family: 'Segoe UI', Roboto, Arial, sans-serif; color: var(--ink); }
+    body {
+      background: radial-gradient(1200px 600px at 50% -10%, #e8f1fb 0%, #eef2f7 45%, #e6ebf2 100%);
+    }
+    #app { display: flex; flex-direction: column; height: 100%; padding: 0; }
+
+    /* Header ---------------------------------------------------------------- */
+    #header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 14px 22px; color: #fff;
+      background: linear-gradient(135deg, var(--brand-dark) 0%, var(--brand) 60%, #3182ce 100%);
+      box-shadow: 0 6px 20px rgba(30, 78, 140, .28);
+      position: relative; z-index: 2;
+    }
+    #header .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+    #header .logo {
+      width: 42px; height: 42px; flex: 0 0 auto; border-radius: 12px;
+      display: flex; align-items: center; justify-content: center; font-size: 22px;
+      background: rgba(255, 255, 255, .16);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .25);
+    }
+    #header .titles { min-width: 0; }
+    #header .t1 { font-weight: 700; font-size: 18px; letter-spacing: .2px; line-height: 1.2; }
+    #header .t2 { font-weight: 400; font-size: 12.5px; opacity: .85;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #header .badge {
+      display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto;
+      padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: rgba(255, 255, 255, .15); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .22);
+    }
+    #header .badge .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: #48f08b;
+      box-shadow: 0 0 0 0 rgba(72, 240, 139, .7); animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(72, 240, 139, .6); }
+      70% { box-shadow: 0 0 0 7px rgba(72, 240, 139, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(72, 240, 139, 0); }
+    }
+
+    /* Chat card ------------------------------------------------------------- */
+    #chatwrap {
+      flex: 1 1 auto; width: 100%; max-width: 880px; margin: 18px auto;
+      display: flex; flex-direction: column; min-height: 0;
+      background: #fff; border: 1px solid var(--line); border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, .12); overflow: hidden;
+    }
+    #status {
+      padding: 10px 18px; font-size: 13px; color: var(--amber);
+      background: #fffaf0; border-bottom: 1px solid #fde8d0;
+    }
+    #status:empty { display: none; }
+    #webchat { flex: 1 1 auto; min-height: 0; width: 100%; }
+
+    /* Loading placeholder (replaced by WebChat once it renders) -------------- */
+    .loading {
+      height: 100%; display: flex; flex-direction: column; gap: 14px;
+      align-items: center; justify-content: center; color: var(--muted); font-size: 14px;
+    }
+    .spinner {
+      width: 30px; height: 30px; border-radius: 50%;
+      border: 3px solid var(--brand-bg); border-top-color: var(--brand);
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #foot {
+      flex: 0 0 auto; text-align: center; color: var(--muted);
+      font-size: 11.5px; padding: 8px 16px 14px;
+    }
+
+    /* Web Chat transcript polish (cosmetic only) ---------------------------- */
+    .webchat__bubble__content { box-shadow: 0 1px 2px rgba(15, 23, 42, .06); }
+    .webchat__basic-transcript { background: linear-gradient(#fbfdff, #f7fafc); }
+
+    @media (max-width: 640px) {
+      #chatwrap { margin: 0; border-radius: 0; border-left: none; border-right: none; }
+      #header .t2 { display: none; }
+    }
   </style>
 </head>
 <body>
   <div id="app">
-    <div id="header">DevOps Commander
-      <span>&middot; ChatOps for the ERP dev environment</span></div>
-    <div id="webchat" role="main"></div>
-    <div id="status"></div>
+    <header id="header">
+      <div class="brand">
+        <div class="logo">&#128737;</div>
+        <div class="titles">
+          <div class="t1">DevOps Commander</div>
+          <div class="t2">Autonomous SRE &middot; ChatOps for the ERP environment</div>
+        </div>
+      </div>
+      <div class="badge"><span class="dot"></span>live</div>
+    </header>
+    <main id="chatwrap">
+      <div id="status"></div>
+      <div id="webchat" role="main">
+        <div class="loading"><span class="spinner"></span>Connecting to DevOps Commander&hellip;</div>
+      </div>
+    </main>
+    <div id="foot">Automated assistant &middot; destructive actions always require human approval.</div>
   </div>
   <script>
     (async function () {
@@ -568,9 +659,36 @@ _WEBCHAT_HTML = """<!DOCTYPE html>
             directLine: window.WebChat.createDirectLine({ token: token }),
             store: store,
             styleOptions: {
+              rootHeight: '100%',
+              rootWidth: '100%',
+              backgroundColor: 'transparent',
+              accent: '#2b6cb0',
               botAvatarInitials: 'DC',
               userAvatarInitials: 'You',
-              accent: '#2b6cb0'
+              botAvatarBackgroundColor: '#2b6cb0',
+              userAvatarBackgroundColor: '#4a5568',
+              avatarSize: 36,
+              bubbleBackground: '#ffffff',
+              bubbleTextColor: '#1a202c',
+              bubbleBorderColor: '#e2e8f0',
+              bubbleBorderRadius: 14,
+              bubbleFromUserBackground: '#2b6cb0',
+              bubbleFromUserTextColor: '#ffffff',
+              bubbleFromUserBorderColor: 'transparent',
+              bubbleFromUserBorderRadius: 14,
+              sendBoxBackground: '#ffffff',
+              sendBoxButtonColor: '#2b6cb0',
+              sendBoxButtonColorOnHover: '#1e4e8c',
+              sendBoxHeight: 48,
+              sendBoxPlaceholderColor: '#94a3b8',
+              primaryFont: "'Segoe UI', Roboto, Arial, sans-serif",
+              fontSizeSmall: '12px',
+              timestampColor: '#94a3b8',
+              suggestedActionBackgroundColor: '#ebf4ff',
+              suggestedActionTextColor: '#2b6cb0',
+              suggestedActionBorderColor: '#bcd4ef',
+              suggestedActionBorderRadius: 18,
+              hideUploadButton: true
             }
           },
           document.getElementById('webchat')
