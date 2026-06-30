@@ -1173,6 +1173,10 @@ def _build_pipeline_message(event: dict) -> str:
 # Pull the first fenced ```json block out of the agent's report. We capture the
 # whole block body (not brace-matched) so nested objects/arrays survive intact.
 _FIX_JSON_RE = re.compile(r"```json\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+# The agent labels its reply in two parts; everything from the PART 2 marker on
+# is the machine fix block (heading + fenced json) and must not leak into the
+# human email body.
+_PART2_RE = re.compile(r"\n[#\s*]*PART\s*2\b.*", re.DOTALL | re.IGNORECASE)
 
 
 def _parse_fix(report: str) -> tuple[str, dict | None]:
@@ -1183,8 +1187,11 @@ def _parse_fix(report: str) -> tuple[str, dict | None]:
     """
     match = _FIX_JSON_RE.search(report or "")
     if not match:
-        return (report or "").strip(), None
+        return _PART2_RE.sub("", report or "").strip(), None
     human = (report[: match.start()] + report[match.end():]).strip()
+    # Drop the trailing "PART 2 — JSON Fix" heading (and any stray text after the
+    # json block) so only the human report remains in the email.
+    human = _PART2_RE.sub("", human).strip()
     try:
         fix = json.loads(match.group(1))
     except Exception:
