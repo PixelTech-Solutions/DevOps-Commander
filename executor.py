@@ -293,6 +293,265 @@ def describe_dev_vms() -> list[dict]:
     return rows
 
 
+# ===========================================================================
+# GitHub CI/CD self-healing (the ONLY place repo writes happen).
+#
+# The thinking agent reads a failed run through the read-only GitHub MCP and
+# proposes a fix change-set. That change-set is stored here (Table Storage) and
+# emailed behind the approval gate. Only on a human Approve does this code:
+#   1. create a new branch from the failing branch,
+#   2. commit the proposed file(s),
+#   3. open a Pull Request,
+#   4. re-run the pipeline (workflow_dispatch on the new branch).
+# Writes use a SEPARATE, write-scoped PAT (GITHUB_EXEC_TOKEN) — never the
+# read-only MCP connection — and only against repos on GITHUB_REPO_ALLOWLIST.
+# ===========================================================================
+GITHUB_API = "https://api.github.com"
+_PIPELINE_FIX_TABLE = "pipelinefixes"
+# Table Storage caps a single string property at ~64 KiB; guard the change-set.
+_MAX_FIX_BYTES = 60_000
+
+
+def github_is_enabled() -> bool:
+    """True when a write-scoped PAT is configured to apply pipeline fixes."""
+    return bool(os.environ.get("GITHUB_EXEC_TOKEN"))
+
+
+def _repo_allowlist() -> set[str]:
+    raw = os.environ.get("GITHUB_REPO_ALLOWLIST", "")
+    return {r.strip() for r in raw.split(",") if r.strip()}
+
+
+def _fix_table():
+    from azure.data.tables import TableServiceClient
+
+    conn = os.environ.get("AzureWebJobsStorage")
+    if not conn:
+        raise ActionError("pipeline-fix store is not configured")
+    service = TableServiceClient.from_connection_string(conn)
+    return service.create_table_if_not_exists(_PIPELINE_FIX_TABLE)
+
+
+def store_pipeline_fix(record: dict) -> str:
+    """Persist a proposed fix change-set and return its id (the approval handle).
+
+    The HMAC token can only carry a tiny payload, so the (potentially large)
+    file contents live here and the token just references this id.
+    """
+    import uuid
+
+    files_json = json.dumps(record.get("files") or [], default=str)
+    if len(files_json.encode("utf-8")) > _MAX_FIX_BYTES:
+        raise ActionError("proposed fix is too large to store safely")
+    fix_id = uuid.uuid4().hex
+    _fix_table().create_entity(
+        {
+            "PartitionKey": "fix",
+            "RowKey": fix_id,
+            "repo": str(record.get("repo") or ""),
+            "base_branch": str(record.get("base_branch") or ""),
+            "run_id": str(record.get("run_id") or ""),
+            "run_url": str(record.get("run_url") or ""),
+            "workflow_path": str(record.get("workflow_path") or ""),
+            "summary": str(record.get("summary") or "")[:512],
+            "files_json": files_json,
+        }
+    )
+    return fix_id
+
+
+def load_pipeline_fix(fix_id: str) -> dict:
+    from azure.core.exceptions import ResourceNotFoundError
+
+    try:
+        entity = _fix_table().get_entity("fix", fix_id)
+    except ResourceNotFoundError:
+        raise ActionError("the proposed fix has expired or was already applied")
+    try:
+        files = json.loads(entity.get("files_json") or "[]")
+    except Exception:
+        files = []
+    return {
+        "repo": entity.get("repo") or "",
+        "base_branch": entity.get("base_branch") or "",
+        "run_id": entity.get("run_id") or "",
+        "run_url": entity.get("run_url") or "",
+        "workflow_path": entity.get("workflow_path") or "",
+        "summary": entity.get("summary") or "",
+        "files": files,
+    }
+
+
+def _gh_api(method: str, path: str, *, body: dict | None = None, allow_404: bool = False):
+    """Call the GitHub REST API with the write PAT (stdlib only — no new deps)."""
+    import urllib.error
+    import urllib.request
+
+    token = os.environ.get("GITHUB_EXEC_TOKEN", "")
+    if not token:
+        raise ActionError("GitHub executor is not configured (GITHUB_EXEC_TOKEN missing)")
+    url = path if path.startswith("http") else f"{GITHUB_API}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", "devops-commander")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404 and allow_404:
+            return 404, None
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise ActionError(f"GitHub API {method} {path} failed ({exc.code}): {detail}")
+    except urllib.error.URLError as exc:
+        raise ActionError(f"GitHub API unreachable: {exc.reason}")
+
+
+def _validate_pipeline_fix(params: dict) -> str:
+    """Gate a pipeline fix without touching GitHub. Returns "" (no shell command).
+
+    Refuses anything outside the repo allow-list or with an empty change-set —
+    the same 'safety lives in code' principle as the VM/EC2 allow-lists.
+    """
+    fix_id = (params or {}).get("fix_id")
+    if not fix_id:
+        raise ActionError("missing fix id")
+    repo = (params or {}).get("repo") or ""
+    allow = _repo_allowlist()
+    if not allow:
+        raise ActionError("no repositories are allow-listed (GITHUB_REPO_ALLOWLIST)")
+    if repo not in allow:
+        raise ActionError(f"repository '{repo}' is not allow-listed for fixes")
+    fix = load_pipeline_fix(fix_id)
+    if fix.get("repo") and fix["repo"] != repo:
+        raise ActionError("fix/repo mismatch")
+    if not fix.get("files"):
+        raise ActionError("the proposed fix has no file changes to apply")
+    return ""
+
+
+def _do_pipeline_fix(params: dict) -> str:
+    """Apply a stored, approved fix: branch -> commit -> PR -> re-run."""
+    import base64
+    import time
+
+    fix = load_pipeline_fix(params["fix_id"])
+    repo = params.get("repo") or fix["repo"]
+    if repo not in _repo_allowlist():
+        raise ActionError(f"repository '{repo}' is not allow-listed for fixes")
+
+    # Resolve the base branch (fall back to the repo default) and its tip sha.
+    base_branch = fix.get("base_branch") or ""
+    if not base_branch:
+        _, info = _gh_api("GET", f"/repos/{repo}")
+        base_branch = (info or {}).get("default_branch") or "main"
+    _, ref = _gh_api("GET", f"/repos/{repo}/git/ref/heads/{base_branch}")
+    base_sha = ref["object"]["sha"]
+
+    # Create a uniquely-named fix branch off that tip.
+    run_id = fix.get("run_id") or "manual"
+    new_branch = f"commander/fix-{run_id}-{int(time.time())}"
+    _gh_api(
+        "POST",
+        f"/repos/{repo}/git/refs",
+        body={"ref": f"refs/heads/{new_branch}", "sha": base_sha},
+    )
+
+    # Commit each proposed file onto the new branch.
+    changed = []
+    for f in fix["files"]:
+        path = f["path"].lstrip("/")
+        content_b64 = base64.b64encode(f["content"].encode("utf-8")).decode()
+        status, existing = _gh_api(
+            "GET", f"/repos/{repo}/contents/{path}?ref={new_branch}", allow_404=True
+        )
+        body = {
+            "message": f"fix(ci): {fix.get('summary') or 'automated pipeline fix'} [{path}]",
+            "content": content_b64,
+            "branch": new_branch,
+        }
+        if status != 404 and existing and existing.get("sha"):
+            body["sha"] = existing["sha"]
+        _gh_api("PUT", f"/repos/{repo}/contents/{path}", body=body)
+        changed.append(path)
+
+    # Open a Pull Request for human review of the applied fix.
+    pr_body = (
+        f"Automated CI/CD fix proposed by DevOps Commander and approved by a human.\n\n"
+        f"**Summary:** {fix.get('summary') or '(none)'}\n"
+        f"**Failed run:** {fix.get('run_url') or fix.get('run_id') or '(unknown)'}\n"
+        f"**Files changed:** {', '.join(changed)}\n"
+    )
+    _, pr = _gh_api(
+        "POST",
+        f"/repos/{repo}/pulls",
+        body={
+            "title": (fix.get("summary") or "Automated pipeline fix")[:120],
+            "head": new_branch,
+            "base": base_branch,
+            "body": pr_body,
+        },
+    )
+    pr_num = pr.get("number")
+    pr_url = pr.get("html_url")
+
+    # Best-effort: re-run the pipeline on the fix branch via workflow_dispatch.
+    rerun = "the PR's required checks will run automatically"
+    wf = fix.get("workflow_path") or ""
+    wf_file = wf.split("/")[-1] if wf else ""
+    if wf_file:
+        try:
+            _gh_api(
+                "POST",
+                f"/repos/{repo}/actions/workflows/{wf_file}/dispatches",
+                body={"ref": new_branch},
+            )
+            rerun = f"re-ran workflow '{wf_file}' on {new_branch}"
+        except ActionError as exc:
+            rerun = f"could not auto-dispatch ({exc}); the PR checks will still run"
+
+    return (
+        f"Opened PR #{pr_num} ({pr_url}) on branch {new_branch} with "
+        f"{len(changed)} file change(s): {', '.join(changed)}. {rerun}."
+    )
+
+
+def _execute_github(action: str, env: str, params: dict, spec: dict) -> dict:
+    """Run an already-validated GitHub pipeline-fix via the write PAT and audit it."""
+    audit = {
+        "action": action,
+        "env": env,
+        "target": "github",
+        "params": params,
+        "destructive": spec["destructive"],
+    }
+    logging.info("executor_attempt %s", json.dumps(audit, default=str))
+
+    if not github_is_enabled():
+        raise ActionError(
+            "GitHub executor is not configured (GITHUB_EXEC_TOKEN missing)"
+        )
+
+    output = spec["run"](params)
+
+    logging.info(
+        "executor_result %s",
+        json.dumps({**audit, "ok": True, "output_chars": len(output)}, default=str),
+    )
+    return {
+        "ok": True,
+        "action": action,
+        "env": env,
+        "target": "github",
+        "output": output,
+    }
+
+
 ACTIONS: dict[str, dict] = {
     "count_customers": {
         "target": "db",
@@ -390,6 +649,14 @@ ACTIONS: dict[str, dict] = {
         "validate": _validate_dev_vm,
         "run": _restart_vm,
     },
+    "fix_pipeline": {
+        "kind": "github",
+        "env": "github",
+        "destructive": True,
+        "description": "Apply an approved CI/CD fix: commit it to a new branch, open a PR, and re-run the pipeline. Params: fix_id, repo. Requires approval.",
+        "validate": _validate_pipeline_fix,
+        "run": _do_pipeline_fix,
+    },
 }
 
 
@@ -465,7 +732,7 @@ def _validate(action: str, env: str, params: dict) -> tuple[dict, str]:
     if spec is None:
         raise ActionError(f"unknown action '{action}'")
     # 2. Cloud control-plane actions validate their own (dev-only) target.
-    if spec.get("kind") in ("cloud", "azurevm"):
+    if spec.get("kind") in ("cloud", "azurevm", "github"):
         if env != spec["env"]:
             raise ActionError(
                 f"action '{action}' runs on '{spec['env']}', not '{env}'"
@@ -489,6 +756,8 @@ def _execute(action: str, env: str, params: dict, spec: dict, command: str) -> d
         return _execute_cloud(action, env, params, spec)
     if spec.get("kind") == "azurevm":
         return _execute_azure_vm(action, env, params, spec)
+    if spec.get("kind") == "github":
+        return _execute_github(action, env, params, spec)
 
     target = ENV_TARGETS[env]
     vm_name = target[spec["target"]]
@@ -615,6 +884,13 @@ def _summarize(action: str, env: str, params: dict) -> str:
         )
     if action == "restart_vm":
         return f"This will RESTART the {env} Azure VM {params.get('vm')}."
+    if action == "fix_pipeline":
+        repo = params.get("repo") or "the repository"
+        return (
+            f"This will COMMIT the proposed fix to {repo} on a new branch, open a "
+            f"Pull Request, and re-run the pipeline. Nothing merges automatically "
+            f"— a human still reviews and merges the PR."
+        )
     return f"This will run '{action}' on {env}."
 
 

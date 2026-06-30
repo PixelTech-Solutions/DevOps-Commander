@@ -95,6 +95,63 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+@app.route(route="pipeline", methods=["POST"])
+def pipeline_failure(req: func.HttpRequest) -> func.HttpResponse:
+    """POST /api/pipeline — a CI/CD pipeline reported a failed run.
+
+    Called by a 'notify on failure' step in the GitHub Actions workflows. The
+    body carries the failed run's coordinates (repo, run_id, run_url, branch,
+    head_sha, workflow). We hand it to the pipeline-triage agent, which reads
+    the run with the read-only GitHub MCP, finds the exact reason, and emails a
+    gated one-click fix. Protected by a shared-secret header (``X-Pipeline-Token``,
+    falling back to ``X-Alert-Token``); the secret is ``PIPELINE_SHARED_SECRET``
+    or, if unset, ``ALERT_SHARED_SECRET``.
+    """
+    expected = (
+        os.environ.get("PIPELINE_SHARED_SECRET")
+        or os.environ.get("ALERT_SHARED_SECRET", "")
+    )
+    presented = (
+        req.headers.get("X-Pipeline-Token")
+        or req.headers.get("X-Alert-Token", "")
+    )
+    if not expected:
+        logging.error("PIPELINE_SHARED_SECRET/ALERT_SHARED_SECRET is not configured")
+        return func.HttpResponse("server misconfigured", status_code=500)
+    if presented != expected:
+        logging.warning("Rejected pipeline: bad/missing X-Pipeline-Token")
+        return func.HttpResponse("unauthorized", status_code=401)
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {"raw": req.get_body().decode("utf-8", errors="replace")}
+    if not isinstance(body, dict):
+        body = {"raw": body}
+
+    event = {
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "source": "github-actions",
+        "payload": body,
+    }
+    logging.info("pipeline_failure_received %s", json.dumps(event, default=str))
+
+    rca_text = None
+    if os.environ.get("AZURE_AI_PROJECT_ENDPOINT"):
+        try:
+            import rca
+
+            rca_text = rca.analyze_pipeline_failure(event)
+        except Exception:
+            logging.exception("pipeline_rca_unavailable")
+
+    return func.HttpResponse(
+        json.dumps({"status": "accepted", "source": "github-actions", "rca": rca_text}),
+        status_code=202,
+        mimetype="application/json",
+    )
+
+
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def health(req: func.HttpRequest) -> func.HttpResponse:
     """GET /api/health — liveness probe (no auth)."""

@@ -50,6 +50,7 @@ from azure.identity import DefaultAzureCredential
 # --- Agent names (referenced by name through the Responses API) --------------
 _COORDINATOR_NAME = "devops-commander-coordinator"
 _CHAT_NAME = "devops-commander-chat"
+_PIPELINE_NAME = "devops-commander-pipeline"
 
 # Cap on local function-tool round-trips per turn (guards against a tool loop).
 _MAX_TOOL_ITERS = 5
@@ -262,6 +263,49 @@ _CHAT_INSTRUCTIONS = (
     "Never infer health from silence. Be concise, friendly, and concrete."
 )
 
+# Pipeline-triage agent: diagnoses a failed GitHub Actions run and proposes a
+# concrete, minimal fix. It reads the failing run with the GitHub MCP (logs +
+# the offending file) and returns BOTH a human report and a machine-readable
+# fix block. It NEVER writes — branch/commit/PR/re-run happen later in code,
+# behind the approval gate.
+_PIPELINE_INSTRUCTIONS = (
+    "You are DevOps Commander's CI/CD triage engineer. A GitHub Actions "
+    "pipeline has FAILED. Find the EXACT reason and propose a minimal, "
+    "high-confidence fix.\n"
+    "You have a read-only GitHub MCP tool. Investigate the failed run that the "
+    "message identifies (use its repository and run id):\n"
+    "1. Get the failed run, then its jobs, then the logs of the FAILED job/step. "
+    "Read the actual error lines — do not guess.\n"
+    "2. Identify the single root cause (e.g. a YAML syntax error, a bad action "
+    "version, a missing input/secret/variable, a failing shell command, a "
+    "dependency/version conflict, a lint/test failure).\n"
+    "3. Fetch the current contents of the file that must change (usually a "
+    "workflow file under .github/workflows/, or a build/config file) so your "
+    "fix is based on the real, current text.\n"
+    "4. Produce the corrected, COMPLETE file content for each file you change.\n\n"
+    "Output EXACTLY two parts, in this order:\n"
+    "PART 1 \u2014 a human report with these labelled lines (one per line):\n"
+    "Root cause: <the precise reason the run failed, citing the error>\n"
+    "Severity: <low|medium|high>\n"
+    "Evidence: <the exact log line(s)/error you saw, and the run id>\n"
+    "Proposed fix: <plain-English description of the change>\n"
+    "Command: <the file(s) being changed, e.g. edit .github/workflows/deploy.yml>\n"
+    "Risk: <low|medium|high>\n"
+    "Approval: needs-human\n\n"
+    "PART 2 \u2014 a single fenced JSON code block (```json ... ```) with the "
+    "machine-applicable fix, of the form:\n"
+    '{\"summary\": \"<one-line PR title>\", \"base_branch\": \"<the branch the run '
+    'failed on>\", \"files\": [{\"path\": \"<repo-relative path>\", \"content\": '
+    '\"<the FULL new file content>\"}]}\n'
+    "Rules for PART 2: include every file you change with its ENTIRE new content "
+    "(not a diff, not a snippet); keep the change minimal and surgical; only "
+    "touch files needed to fix THIS failure; never include secrets. If you "
+    "genuinely cannot determine a safe fix, set \"files\" to an empty list and "
+    "explain why in the report \u2014 do NOT invent a change.\n"
+    "Always end with Approval: needs-human \u2014 a human approves before anything "
+    "is committed."
+)
+
 
 def is_enabled() -> bool:
     """True when the Foundry project endpoint is configured."""
@@ -380,6 +424,28 @@ def _mcp_tools() -> list:
         if aws_conn:
             aws_kwargs["project_connection_id"] = aws_conn
         tools.append(MCPTool(**aws_kwargs))
+
+    # GitHub MCP (READ-ONLY): the official remote GitHub MCP server, used to
+    # triage CI/CD failures — read workflow runs, job logs and file contents to
+    # find the EXACT reason a pipeline failed. The endpoint is the read-only
+    # variant (.../mcp/readonly) and the connection's PAT is read-scoped, so the
+    # model can inspect but never mutate a repo. All writes (branch, commit, PR,
+    # re-run) happen later in executor.py behind the human approval gate.
+    gh_url = os.environ.get("GITHUB_MCP_URL")
+    gh_conn = os.environ.get("GITHUB_MCP_CONNECTION", "github-mcp")
+    if gh_url and gh_conn:
+        tools.append(
+            MCPTool(
+                server_label="github",
+                server_url=gh_url,
+                server_description=(
+                    "GitHub (read-only): workflow runs, job logs, file contents "
+                    "and commits. Use it to diagnose why a CI/CD pipeline failed."
+                ),
+                project_connection_id=gh_conn,
+                require_approval="never",
+            )
+        )
 
     return tools
 
@@ -777,6 +843,16 @@ def _ensure_agents() -> bool:
             tools=base + _dev_function_tools() + _cloud_function_tools(),
         ),
     )
+    # The pipeline-triage agent gets the same read-only base (incl. GitHub MCP)
+    # so it can read failed runs/logs/files; it proposes a fix but never writes.
+    client.agents.create_version(
+        _PIPELINE_NAME,
+        definition=PromptAgentDefinition(
+            model=_model(),
+            instructions=_PIPELINE_INSTRUCTIONS,
+            tools=base,
+        ),
+    )
     return True
 
 
@@ -1014,6 +1090,110 @@ def analyze_alert(event: dict) -> str | None:
         return report or None
     except Exception:
         logging.exception("agent_rca_failed")
+        return None
+
+
+def _build_pipeline_message(event: dict) -> str:
+    """Compose the triage prompt from a GitHub Actions failure payload."""
+    p = event.get("payload") if isinstance(event.get("payload"), dict) else event
+    p = p or {}
+    fields = {
+        "repository": p.get("repo") or p.get("repository"),
+        "workflow": p.get("workflow") or p.get("workflow_name"),
+        "workflow file": p.get("workflow_path") or p.get("workflow_file"),
+        "run id": p.get("run_id"),
+        "run url": p.get("run_url") or p.get("html_url"),
+        "branch": p.get("branch") or p.get("ref_name") or p.get("head_branch"),
+        "head sha": p.get("head_sha") or p.get("sha"),
+        "triggering event": p.get("event") or p.get("event_name"),
+        "actor": p.get("actor"),
+    }
+    lines = [f"{k}: {v}" for k, v in fields.items() if v]
+    extra = json.dumps(p, default=str)[:1500]
+    return (
+        "A GitHub Actions pipeline run FAILED. Investigate it with the GitHub "
+        "MCP (read-only) and return your report plus the JSON fix block.\n"
+        + "\n".join(lines)
+        + f"\n\nRaw payload (for any extra context):\n{extra}"
+    )
+
+
+# Pull the first fenced ```json block out of the agent's report. We capture the
+# whole block body (not brace-matched) so nested objects/arrays survive intact.
+_FIX_JSON_RE = re.compile(r"```json\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _parse_fix(report: str) -> tuple[str, dict | None]:
+    """Split the agent's reply into (human_report, fix_dict).
+
+    The fix block is removed from the human report so the email stays clean.
+    Returns ``(report, None)`` when no valid fix block is present.
+    """
+    match = _FIX_JSON_RE.search(report or "")
+    if not match:
+        return (report or "").strip(), None
+    human = (report[: match.start()] + report[match.end():]).strip()
+    try:
+        fix = json.loads(match.group(1))
+    except Exception:
+        logging.warning("pipeline_fix_unparseable", exc_info=True)
+        return human, None
+    if not isinstance(fix, dict):
+        return human, None
+    files = fix.get("files")
+    if not isinstance(files, list):
+        fix["files"] = []
+    else:
+        fix["files"] = [
+            f for f in files
+            if isinstance(f, dict) and f.get("path") and isinstance(f.get("content"), str)
+        ]
+    return human, fix
+
+
+def analyze_pipeline_failure(event: dict) -> str | None:
+    """Diagnose a failed CI/CD run and email a gated, one-click fix.
+
+    Mirrors :func:`analyze_alert` but for GitHub Actions: the pipeline agent
+    reads the failed run/logs/file via the read-only GitHub MCP, returns a
+    human RCA plus a machine-applicable fix change-set. The change-set is stored
+    (Table Storage) and a ``fix_pipeline`` approval token is emailed — only on a
+    human Approve does executor.py create the branch, commit the fix, open a PR
+    and re-run the workflow. Best-effort: errors are logged and swallowed so the
+    webhook is always acknowledged.
+    """
+    try:
+        content = _build_pipeline_message(event)
+        try:
+            report, _ = _respond(_PIPELINE_NAME, content)
+        except Exception as exc:
+            logging.exception("pipeline_rca_failed")
+            report = (
+                "Root cause: Automated CI/CD triage was unavailable (the analysis "
+                f"agent could not complete). Agent error: {type(exc).__name__}: {exc}\n"
+                "Severity: Unknown\nEvidence: see the failed run on GitHub.\n"
+                "Proposed fix: A human should inspect the run logs directly.\n"
+                "Risk: Unknown\nApproval: needs-human"
+            )
+
+        human_report, fix = _parse_fix(report or "")
+        # Pipeline fixes ALWAYS gate to a human — never auto-applied.
+        decision, reason = "HOLD", "a pipeline fix always requires human sign-off"
+        human_report = (
+            f"{human_report}\nGate (enforced in code): {decision} — {reason}"
+        )
+
+        p = event.get("payload") if isinstance(event.get("payload"), dict) else event
+        p = p or {}
+        try:
+            import notifier
+
+            notifier.notify_pipeline_failure(human_report, decision, reason, p, fix)
+        except Exception:
+            logging.exception("pipeline_notify_failed")
+        return human_report or None
+    except Exception:
+        logging.exception("pipeline_rca_failed")
         return None
 
 

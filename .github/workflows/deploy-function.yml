@@ -172,3 +172,45 @@ jobs:
           echo "::error::Health check never returned 200"
           cat /tmp/body || true
           exit 1
+
+  # 5) Self-healing hook: if ANY job above failed, tell DevOps Commander so it
+  #    can diagnose the failure (read-only GitHub MCP) and email a gated,
+  #    one-click fix. Best-effort — it must never change the run's outcome, and
+  #    the /api/pipeline endpoint only exists once this app has deployed at
+  #    least once (the very first failed deploy simply gets no notification).
+  notify-failure:
+    name: Notify DevOps Commander on failure
+    needs: [precheck, build, deploy, smoke-test]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST the failed run to /api/pipeline
+        env:
+          FUNCTION_APP_NAME: ${{ vars.FUNCTION_APP_NAME }}
+          PIPELINE_TOKEN: ${{ secrets.ALERT_SHARED_SECRET }}
+        run: |
+          if [ -z "$FUNCTION_APP_NAME" ] || [ -z "$PIPELINE_TOKEN" ]; then
+            echo "FUNCTION_APP_NAME or ALERT_SHARED_SECRET missing — skipping notify."
+            exit 0
+          fi
+          url="https://${FUNCTION_APP_NAME}.azurewebsites.net/api/pipeline"
+          payload=$(jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg workflow "${{ github.workflow }}" \
+            --arg workflow_ref "${{ github.workflow_ref }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg head_sha "${{ github.sha }}" \
+            --arg event "${{ github.event_name }}" \
+            --arg actor "${{ github.actor }}" \
+            '{repo:$repo, workflow:$workflow, workflow_ref:$workflow_ref, run_id:$run_id, run_url:$run_url, branch:$branch, head_sha:$head_sha, event:$event, actor:$actor}')
+          echo "Notifying $url"
+          code=$(curl -s -o /tmp/resp -w "%{http_code}" -X POST "$url" \
+            -H "X-Pipeline-Token: ${PIPELINE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$payload" || echo 000)
+          echo "HTTP $code"
+          cat /tmp/resp 2>/dev/null || true
+          # Never fail the run because of the notification.
+          exit 0

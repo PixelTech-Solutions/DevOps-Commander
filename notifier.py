@@ -215,7 +215,14 @@ def _severity_badge(value: str) -> tuple[str, str]:
 
 
 def _build_email(report: str, decision: str, reason: str,
-                 source: str, approval: dict | None, chat_url: str) -> tuple[str, str]:
+                 source: str, approval: dict | None, chat_url: str,
+                 *, subtitle: str = "Autonomous SRE · Incident Report",
+                 kicker: str = "Triggered by", subject_noun: str = "alert",
+                 followup_label: str = "Open live chat about this alert",
+                 followup_text: str = (
+                     "Need to dig deeper? Continue the investigation with the "
+                     "agent — live logs, metrics and further fixes."
+                 )) -> tuple[str, str]:
     """Return (plain_text, html) bodies for the notification email."""
     fields = _parse_report(report)
 
@@ -338,19 +345,18 @@ def _build_email(report: str, decision: str, reason: str,
     # ---- Live-chat follow-up ------------------------------------------------
     chat_html = ""
     if chat_url:
-        text += f"\n\nStill not resolved? Open a live chat:\n{chat_url}"
+        text += f"\n\n{followup_text}\n{chat_url}"
         chat_html = (
             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
             f'style="margin-top:18px;"><tr><td style="padding-top:18px;'
             f'border-top:1px solid #eaecef;">'
             f'<div style="font:13px/1.55 {_FONT};color:#586069;margin-bottom:12px;">'
-            f'Need to dig deeper? Continue the investigation with the agent &mdash; '
-            f'live logs, metrics and further fixes.</div>'
+            f'{_esc(followup_text)}</div>'
             f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
             f'<td style="border-radius:8px;border:1px solid #d0d7de;background:#ffffff;">'
             f'<a href="{chat_url}" style="display:inline-block;padding:11px 24px;'
             f'font:600 14px/1 {_FONT};color:#0969da;text-decoration:none;">'
-            f'&#128172;&nbsp; Open live chat about this alert</a>'
+            f'&#128172;&nbsp; {_esc(followup_label)}</a>'
             f'</td></tr></table></td></tr></table>'
         )
 
@@ -375,7 +381,7 @@ def _build_email(report: str, decision: str, reason: str,
         f'<div style="font:700 18px/1.2 {_FONT};color:#ffffff;">'
         '&#128737;&#65039;&nbsp; DevOps Commander</div>'
         f'<div style="margin-top:3px;font:12px/1.2 {_FONT};color:#9aa4c4;">'
-        'Autonomous SRE &middot; Incident Report</div>'
+        f'{_esc(subtitle)}</div>'
         '</td><td align="right" style="vertical-align:middle;">'
         f'<span style="display:inline-block;background:{sev_bg};color:#fff;'
         f'font:700 11px/1 {_FONT};letter-spacing:.04em;padding:6px 13px;'
@@ -384,9 +390,9 @@ def _build_email(report: str, decision: str, reason: str,
         # Sub-header (source + time)
         '<tr><td style="padding:20px 28px 4px;">'
         f'<div style="font:12px/1 {_FONT};color:#8a94a6;text-transform:uppercase;'
-        'letter-spacing:.08em;">Triggered by</div>'
+        f'letter-spacing:.08em;">{_esc(kicker)}</div>'
         f'<div style="margin-top:5px;font:600 17px/1.3 {_FONT};color:#161a35;">'
-        f'{_esc(source)} alert</div>'
+        f'{_esc(source)} {_esc(subject_noun)}</div>'
         f'<div style="margin-top:3px;font:12px/1 {_FONT};color:#a0a8b8;">'
         f'{sent_at}</div></td></tr>'
         # Body
@@ -471,3 +477,97 @@ def notify_alert(report: str, decision: str, reason: str, source: str) -> None:
         _send_teams(teams_text, approval)
     except Exception:
         logging.exception("notify_alert_failed")
+
+
+def _workflow_file_from_payload(payload: dict) -> str:
+    """Best-effort: the workflow file basename, for a re-run dispatch.
+
+    Accepts an explicit ``workflow_path``/``workflow_file`` or derives it from
+    GitHub's ``workflow_ref`` (e.g. ``owner/repo/.github/workflows/x.yml@ref``).
+    """
+    direct = payload.get("workflow_path") or payload.get("workflow_file")
+    if direct:
+        return str(direct)
+    ref = payload.get("workflow_ref") or ""
+    if ref:
+        path = ref.split("@", 1)[0]
+        idx = path.find(".github/workflows/")
+        if idx != -1:
+            return path[idx:]
+    return ""
+
+
+def _maybe_make_pipeline_approval(payload: dict, fix: dict | None) -> dict | None:
+    """Store the proposed fix and mint a ``fix_pipeline`` approval token.
+
+    Returns the executor approval result (token + summary) or None when the
+    executor/GitHub is not configured or there is no concrete fix to apply.
+    Never raises — the email still goes out without buttons.
+    """
+    if not fix or not fix.get("files"):
+        return None
+    try:
+        import executor
+
+        if not executor.github_is_enabled():
+            return None
+        repo = payload.get("repo") or payload.get("repository") or ""
+        record = {
+            "repo": repo,
+            "base_branch": (
+                fix.get("base_branch")
+                or payload.get("branch")
+                or payload.get("ref_name")
+                or payload.get("head_branch")
+            ),
+            "run_id": payload.get("run_id"),
+            "run_url": payload.get("run_url") or payload.get("html_url"),
+            "workflow_path": _workflow_file_from_payload(payload),
+            "summary": fix.get("summary"),
+            "files": fix.get("files"),
+        }
+        fix_id = executor.store_pipeline_fix(record)
+        result = executor.request_action(
+            "fix_pipeline", "github", {"fix_id": fix_id, "repo": repo}
+        )
+        return result if result.get("requires_approval") else None
+    except Exception:
+        logging.exception("pipeline_approval_mint_failed")
+        return None
+
+
+def notify_pipeline_failure(report: str, decision: str, reason: str,
+                            payload: dict, fix: dict | None) -> None:
+    """Email a failed-pipeline RCA with a gated, one-click fix (Approve/Reject).
+
+    ``report`` is the agent's CI/CD triage; ``payload`` is the GitHub Actions
+    failure context; ``fix`` is the parsed change-set (or None). When a concrete
+    fix and a write PAT are available, an approval token is minted so a human
+    can apply it from the email. Never raises.
+    """
+    try:
+        payload = payload or {}
+        repo = payload.get("repo") or payload.get("repository") or "repository"
+        workflow = payload.get("workflow") or payload.get("workflow_name") or "workflow"
+        run_url = payload.get("run_url") or payload.get("html_url") or ""
+
+        approval = _maybe_make_pipeline_approval(payload, fix)
+
+        subject = f"[DevOps Commander] Pipeline failed — {repo} · {workflow}"
+        text, html = _build_email(
+            report, decision, reason, repo, approval, run_url,
+            subtitle="Autonomous SRE · CI/CD Triage",
+            kicker="Failed pipeline",
+            subject_noun=f"· {workflow}",
+            followup_label="View the failed workflow run",
+            followup_text="Inspect the full CI logs for this run on GitHub.",
+        )
+        _send_email(subject, text, html)
+
+        teams_text = (
+            f"\U0001f6a8 Pipeline failed — {repo} · {workflow} "
+            f"(gate: {decision})\n\n{report}"
+        )
+        _send_teams(teams_text, approval)
+    except Exception:
+        logging.exception("notify_pipeline_failure_failed")
