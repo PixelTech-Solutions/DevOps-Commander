@@ -264,7 +264,14 @@ _CHAT_INSTRUCTIONS = (
     "say so explicitly ('I could not retrieve current metrics for <host> — it may "
     "be down'), verify the specific alerting host (e.g. query whether its series "
     "still reports in Grafana/Prometheus), and recommend the next concrete check. "
-    "Never infer health from silence. Be concise, friendly, and concrete."
+    "Never infer health from silence. Be concise, friendly, and concrete.\n"
+    "MANDATORY TOOL-USE RULE — you MUST NEVER answer a question about current "
+    "system state, metrics, alerts, health, or status from memory or training "
+    "data. You MUST call the relevant MCP tool (Datadog, Grafana, Azure, AWS, "
+    "or GitHub) FIRST and base your answer ONLY on the tool's response. If the "
+    "tool returns no data or an error, say exactly that — never fabricate a "
+    "'looks fine' or 'no alerts' answer without tool evidence. This is a hard "
+    "rule with zero exceptions."
 )
 
 # Pipeline-triage agent: diagnoses a failed GitHub Actions run and proposes a
