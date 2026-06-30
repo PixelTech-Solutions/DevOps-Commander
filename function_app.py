@@ -43,7 +43,7 @@ def alert_receiver(req: func.HttpRequest) -> func.HttpResponse:
     presented = req.headers.get("X-Alert-Token", "")
     if not expected:
         logging.error("ALERT_SHARED_SECRET app setting is not configured")
-        return func.HttpResponse("server misconfigured", status_code=500
+        return func.HttpResponse("server misconfigured", status_code=500)
     if presented != expected:
         logging.warning(
             "Rejected alert: bad/missing X-Alert-Token from %s",

@@ -196,7 +196,9 @@ def _parse_report(report: str) -> dict[str, str]:
         key = re.sub(r"\s*\(.*\)\s*", "", raw_label).strip()
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(report)
-        fields[key] = report[start:end].strip()
+        value = report[start:end].strip()
+        value = re.sub(r"(?m)\s*^[-*_]{3,}\s*$", "", value).strip()
+        fields[key] = value
     return fields
 
 
