@@ -882,6 +882,47 @@ def _resp_text(resp) -> str:
     return "\n".join(parts).strip()
 
 
+def _log_mcp_activity(resp, where: str) -> None:
+    """Log every server-side MCP item in a Responses result.
+
+    MCP tools execute server-side, so the only window into what the agent
+    actually did is the response's output items. We log each ``mcp_call``
+    (server/tool/args + whether it returned output or an error) and each
+    ``mcp_list_tools`` discovery, so a triage that hallucinates instead of
+    reading real logs is visible in App Insights. Best-effort; never raises.
+    """
+    try:
+        for item in getattr(resp, "output", None) or []:
+            itype = getattr(item, "type", None)
+            if itype == "mcp_call":
+                err = getattr(item, "error", None)
+                out = getattr(item, "output", None)
+                args = getattr(item, "arguments", "")
+                if isinstance(args, str):
+                    args = args[:300]
+                logging.info(
+                    "mcp_call where=%s server=%s tool=%s args=%s "
+                    "error=%s output_len=%s",
+                    where,
+                    getattr(item, "server_label", "?"),
+                    getattr(item, "name", "?"),
+                    args,
+                    (str(err)[:300] if err else None),
+                    (len(out) if isinstance(out, str) else None),
+                )
+            elif itype == "mcp_list_tools":
+                tools = getattr(item, "tools", None) or []
+                names = [getattr(t, "name", "?") for t in tools][:50]
+                logging.info(
+                    "mcp_list_tools where=%s server=%s tools=%s",
+                    where,
+                    getattr(item, "server_label", "?"),
+                    names,
+                )
+    except Exception:  # noqa: BLE001
+        logging.debug("mcp_activity_log_failed", exc_info=True)
+
+
 def _tool_error_note(exc: Exception) -> str | None:
     """If ``exc`` is a server-side MCP/tool failure, return a short corrective
     note (which tool failed and why) to feed back into a retry; else None.
@@ -919,6 +960,7 @@ def _respond(agent_name: str, message: str, conversation_id: str | None = None):
             extra_body=agent_ref,
             input=text,
         )
+        _log_mcp_activity(resp, "initial")
         # The runtime executes MCP/Search server-side, but local dev function
         # tools run here: drive any function calls to completion before reading
         # the final text. Capped so a tool loop can never spin forever.
